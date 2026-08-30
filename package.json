@@ -1,0 +1,20 @@
+{
+  "name": "@supercode/plugin-updater",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenCode TUI plugin: daily update check for floating-spec npm plugins (Update Checker, feature 041).",
+  "scripts": {
+    "test": "node --test 'src/**/*.test.ts'",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.17.8",
+    "@opencode-ai/sdk": "1.17.8",
+    "@types/node": "24.13.3",
+    "typescript": "5.8.2"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
