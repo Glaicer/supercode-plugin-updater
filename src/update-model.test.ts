@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import test from "node:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Config } from "@opencode-ai/sdk/v2";
@@ -883,5 +884,315 @@ test("a corrupt lastCheck is treated as absent, not as fresh", async () => {
     await build().start();
 
     assert.deepEqual([...port.calls], ["foo"]);
+  });
+});
+
+/**
+ * Ticket 04: Pending Invalidation — confirm marks the confirmed `{kind,
+ * spec}` list in kv and toasts once; the filesystem only changes when the
+ * captured dispose callback (or recovery at the next start) consumes the
+ * marker. Every "start" below is a re-instantiation over the same fake api
+ * (same kv), per Testing Decisions.
+ */
+const PENDING_KEY = "plugin-updates.pending";
+const PREPARED_TOAST = "Updates prepared. Restart OpenCode to apply them.";
+/** chmod-based failure fixtures need real permission checks (no root). */
+const SKIP_AS_ROOT =
+  typeof process.getuid === "function" && process.getuid() === 0 ? "permission fixtures require a non-root user" : false;
+
+test("confirm writes the pending marker, toasts exactly once, and touches no files", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    await installTool(root, "pyright", "1.1.411");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo"] });
+    const model = build();
+
+    model.confirm([
+      { kind: "plugin", spec: "foo" },
+      { kind: "tool", spec: "pyright" },
+    ]);
+
+    assert.deepEqual(fake.kv.get(PENDING_KEY), [
+      { kind: "plugin", spec: "foo" },
+      { kind: "tool", spec: "pyright" },
+    ]);
+    assert.deepEqual(fake.toasts.map((t) => t.message), [PREPARED_TOAST]);
+    assert.equal(model.state, "pending-restart");
+    // Nothing on disk before dispose (US 7, 18, 19).
+    assert.ok(existsSync(join(root, "foo@latest")));
+    assert.ok(existsSync(join(root, "pyright")));
+  });
+});
+
+test("confirm with an empty selection is a no-op — no marker, no toast", async () => {
+  await withCacheRoot(async (root) => {
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo"] });
+    const model = build();
+
+    model.confirm([]);
+
+    assert.equal(fake.kv.get(PENDING_KEY), undefined);
+    assert.deepEqual(fake.toasts, []);
+    assert.equal(model.state, "idle");
+  });
+});
+
+test("the captured dispose callback removes only the selected packages' dirs", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    await installPackage(root, "bar", "1.0.0");
+    await installPackage(root, "left-pad", "1.0.0");
+    await installTool(root, "pyright", "1.1.411");
+    await installTool(root, "prettier", "3.8.4");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo", "bar"] });
+    const model = build();
+    model.confirm([
+      { kind: "plugin", spec: "foo" },
+      { kind: "tool", spec: "pyright" },
+    ]);
+
+    assert.equal(fake.disposeCallbacks.length, 1);
+    await fake.disposeCallbacks[0]!();
+
+    assert.ok(!existsSync(join(root, "foo@latest")));
+    assert.ok(!existsSync(join(root, "pyright")));
+    // Foreign dirs and the cache root stay untouched (US 26).
+    assert.ok(existsSync(join(root, "bar@latest")));
+    assert.ok(existsSync(join(root, "left-pad@latest")));
+    assert.ok(existsSync(join(root, "prettier")));
+    assert.ok(existsSync(root));
+    assert.equal(fake.kv.get(PENDING_KEY), null);
+    assert.equal(model.state, "idle");
+  });
+});
+
+test("consumption is element-wise: a failed dir keeps its marker entry, the rest are erased", { skip: SKIP_AS_ROOT }, async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    await installPackage(root, "baz", "1.0.0");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo", "baz"] });
+    const model = build();
+    model.confirm([
+      { kind: "plugin", spec: "foo" },
+      { kind: "plugin", spec: "baz" },
+    ]);
+
+    // A read-only key dir makes the removal fail (EACCES); dispose is
+    // best-effort and must not throw (US 21).
+    const doomed = join(root, "baz@latest");
+    await chmod(doomed, 0o500);
+    try {
+      await fake.disposeCallbacks[0]!();
+    } finally {
+      await chmod(doomed, 0o700);
+    }
+
+    assert.ok(!existsSync(join(root, "foo@latest")));
+    assert.ok(existsSync(doomed));
+    // The consumed entry is erased element-wise; the failed one stays.
+    assert.deepEqual(fake.kv.get(PENDING_KEY), [{ kind: "plugin", spec: "baz" }]);
+    assert.equal(model.state, "cache-invalidated");
+  });
+});
+
+test("scoped package with two generations: dispose removes the current resolver dir only", async () => {
+  await withCacheRoot(async (root) => {
+    await installLegacyGeneration(root, "@scope/name", "0.0.1");
+    await installPackage(root, "@scope/name", "0.2.0");
+    const port = spyPort(async () => ({ version: "0.3.0" }));
+    const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["@scope/name"] });
+    build().confirm([{ kind: "plugin", spec: "@scope/name" }]);
+
+    await fake.disposeCallbacks[0]!();
+
+    assert.ok(!existsSync(join(root, "@scope", "name@latest")));
+    assert.ok(existsSync(join(root, "@scope", "name")));
+  });
+});
+
+test("one package marked as both kinds resolves each kind's own dir", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "prettier", "1.0.0");
+    await installTool(root, "prettier", "3.8.4");
+    await installTool(root, "oxfmt", "1.0.0");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["prettier@latest"] });
+    build().confirm([
+      { kind: "plugin", spec: "prettier@latest" },
+      { kind: "tool", spec: "prettier" },
+    ]);
+
+    await fake.disposeCallbacks[0]!();
+
+    assert.ok(!existsSync(join(root, "prettier@latest")));
+    assert.ok(!existsSync(join(root, "prettier")));
+    assert.ok(existsSync(join(root, "oxfmt")));
+  });
+});
+
+test("recovery: a new start over the same kv drains pending before the 24h decision", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo"] });
+
+    const first = build();
+    await first.start(); // counted cycle: toast + fresh lastCheck
+    assert.equal(fake.toasts.length, 1);
+    first.confirm([{ kind: "plugin", spec: "foo" }]);
+
+    await build().start(); // recovery drains; lastCheck still fresh → no cycle
+
+    assert.ok(!existsSync(join(root, "foo@latest")));
+    assert.equal(fake.kv.get(PENDING_KEY), null);
+    assert.deepEqual([...port.calls], ["foo"]); // no second cycle
+    // The drain emits nothing: still one cycle toast + the prepared one.
+    assert.deepEqual(
+      fake.toasts.map((t) => t.message),
+      [TOAST_MESSAGE(1), PREPARED_TOAST],
+    );
+  });
+});
+
+test("recovery runs before the cycle: the drained package is already gone when the cycle looks", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo"] });
+
+    build().confirm([{ kind: "plugin", spec: "foo" }]); // no lastCheck at all
+
+    const revived = build();
+    await revived.start(); // drain FIRST, then the absent lastCheck → cycle
+
+    assert.ok(!existsSync(join(root, "foo@latest")));
+    assert.equal(fake.kv.get(PENDING_KEY), null);
+    // The cycle ran after the drain: foo's dir is gone → unknown "not in
+    // cache" with zero registry traffic; no updates, no toast.
+    const snapshot = revived.getSnapshot();
+    assert.ok(snapshot);
+    const foo = candidateBySpec(snapshot, "foo");
+    assert.equal(foo.status, "unknown");
+    assert.equal(foo.reason, "not in cache");
+    assert.deepEqual([...port.calls], []);
+    // The only toast is the confirm's prepared one — recovery and the
+    // post-drain cycle added none.
+    assert.deepEqual(fake.toasts.map((t) => t.message), [PREPARED_TOAST]);
+  });
+});
+
+test("a cycle result cannot un-confirm: a manual check with updates keeps pending-restart", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { build } = makeHarness(port.fetchLatest, root, { specs: ["foo"] });
+    const model = build();
+
+    model.confirm([{ kind: "plugin", spec: "foo" }]);
+    assert.equal(model.state, "pending-restart");
+
+    await model.runCheck(); // still finds updates
+    assert.equal(model.state, "pending-restart");
+  });
+});
+
+test("re-confirming merges into the marker: earlier selections survive until consumed", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    await installPackage(root, "bar", "1.0.0");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo", "bar"] });
+    const model = build();
+
+    model.confirm([{ kind: "plugin", spec: "foo" }]);
+    // Second confirm re-offers foo and adds bar: the marker must hold both,
+    // foo only once — overwriting would silently drop the first selection.
+    model.confirm([
+      { kind: "plugin", spec: "bar" },
+      { kind: "plugin", spec: "foo" },
+    ]);
+
+    assert.deepEqual(fake.kv.get(PENDING_KEY), [
+      { kind: "plugin", spec: "foo" },
+      { kind: "plugin", spec: "bar" },
+    ]);
+    // Exactly one prepared toast per confirm.
+    assert.deepEqual(fake.toasts.map((t) => t.message), [PREPARED_TOAST, PREPARED_TOAST]);
+
+    await fake.disposeCallbacks[0]!();
+    assert.ok(!existsSync(join(root, "foo@latest")));
+    assert.ok(!existsSync(join(root, "bar@latest")));
+    assert.equal(fake.kv.get(PENDING_KEY), null);
+  });
+});
+
+test("pending never leaks: marker entries are not candidates and add no toasts", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo"] });
+    const model = build();
+
+    await model.start();
+    assert.deepEqual(fake.toasts.map((t) => t.message), [TOAST_MESSAGE(1)]);
+
+    model.confirm([
+      { kind: "plugin", spec: "foo" },
+      { kind: "plugin", spec: "ghost" }, // marked, but in neither config nor cache
+    ]);
+    assert.deepEqual(fake.toasts.map((t) => t.message), [TOAST_MESSAGE(1), PREPARED_TOAST]);
+
+    const result = await model.runCheck();
+    assert.ok(!result.candidates.some((c) => c.spec === "ghost"));
+    // Still exactly the two toasts: pending inflates neither the candidate
+    // list nor the toast counter.
+    assert.deepEqual(fake.toasts.map((t) => t.message), [TOAST_MESSAGE(1), PREPARED_TOAST]);
+  });
+});
+
+test("state machine: full circle idle → updates-available → pending-restart → cache-invalidated → idle", { skip: SKIP_AS_ROOT }, async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    await installPackage(root, "baz", "1.0.0");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo", "baz"] });
+
+    const model = build();
+    assert.equal(model.state, "idle");
+
+    await model.start();
+    assert.equal(model.state, "updates-available");
+
+    model.confirm([
+      { kind: "plugin", spec: "foo" },
+      { kind: "plugin", spec: "baz" },
+    ]);
+    assert.equal(model.state, "pending-restart");
+
+    // A partial dispose: baz's dir fails, so invalidation is not complete
+    // and the machine holds cache-invalidated with baz's entry intact.
+    const doomed = join(root, "baz@latest");
+    await chmod(doomed, 0o500);
+    try {
+      await fake.disposeCallbacks[0]!();
+    } finally {
+      await chmod(doomed, 0o700);
+    }
+    assert.ok(!existsSync(join(root, "foo@latest")));
+    assert.ok(existsSync(doomed));
+    assert.equal(model.state, "cache-invalidated");
+    assert.deepEqual(fake.kv.get(PENDING_KEY), [{ kind: "plugin", spec: "baz" }]);
+
+    // The retry is recovery at the next start over the same kv: it finishes
+    // the drain and the machine comes full circle.
+    const revived = build();
+    await revived.start();
+    assert.ok(!existsSync(doomed));
+    assert.equal(fake.kv.get(PENDING_KEY), null);
+    assert.equal(revived.state, "idle");
   });
 });
