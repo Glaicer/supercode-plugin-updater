@@ -47,6 +47,9 @@ import { createSelection, isSelectable, type PendingEntry } from "./selection.ts
 
 const ROUTE_NAME = "plugin-updates";
 
+/** Selection lists longer than this get the large dialog preset. */
+const LARGE_DIALOG_MAX_ROWS = 6;
+
 /** What the palette command stashes into the route params for Esc (US 14). */
 interface ReturnRouteParams {
   returnRoute?: { name: string; params?: Record<string, unknown> };
@@ -217,7 +220,7 @@ function UpdatesScreen(props: {
     if (selection.isEmpty(candidates())) return;
     openConfirm(selection.selectedEntries(candidates()));
   };
-  const refresh = () => {
+  const manualRefresh = () => {
     // One cycle at a time: a manual R never overlaps the startup cycle or
     // another R (the model dedupes only start()).
     if (props.checking()) return;
@@ -239,7 +242,7 @@ function UpdatesScreen(props: {
         { name: "plugin-updates.toggle", desc: "Toggle the highlighted package", run: toggle },
         { name: "plugin-updates.select-all", desc: "Select all selectable packages", run: selectAll },
         { name: "plugin-updates.update", desc: "Prepare updates for the selected packages", run: update },
-        { name: "plugin-updates.refresh", desc: "Re-check for updates now", run: refresh },
+        { name: "plugin-updates.refresh", desc: "Re-check for updates now", run: manualRefresh },
       ],
       bindings: [
         { key: "escape", cmd: "plugin-updates.close", desc: "Close", group: "Plugin Updates" },
@@ -290,7 +293,7 @@ function UpdatesScreen(props: {
         }),
       () => finish(false),
     );
-    if (entries.length > 6) props.api.ui.dialog.setSize("large");
+    if (entries.length > LARGE_DIALOG_MAX_ROWS) props.api.ui.dialog.setSize("large");
   }
 
   // Bindings live only while this screen is mounted: registered on mount,
