@@ -38,8 +38,8 @@ export const REGISTRY_TIMEOUT_MS = 5000;
 export const REGISTRY_CONCURRENCY = 4;
 /** Minimum period between counted check cycles (US 1). */
 export const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
-/** The one prepared toast per confirm (US 18). */
-const PREPARED_TOAST_MESSAGE = "Updates prepared. Restart OpenCode to apply them.";
+/** The one prepared toast per confirm (US 18) — reused verbatim by the screen's pending banner. */
+export const PREPARED_TOAST_MESSAGE = "Updates prepared. Restart OpenCode to apply them.";
 
 export type UpdateCandidateStatus = "checked" | "pinned" | "unknown";
 
