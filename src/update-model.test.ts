@@ -7,6 +7,7 @@ import type { Config } from "@opencode-ai/sdk/v2";
 import { createNpmRegistryPort, type FetchLatest } from "./checker.ts";
 import { REGISTRY_CONCURRENCY, REGISTRY_TIMEOUT_MS, createUpdateModel, type CheckResult, type UpdateCandidate } from "./update-model.ts";
 import { createFakeTuiApi } from "./fake-tui-api.ts";
+import { MANAGED_TOOLS } from "./tools.ts";
 
 /**
  * Every test runs the single seam — the Update Model under a fake
@@ -24,7 +25,14 @@ async function withCacheRoot(fn: (root: string) => Promise<void>): Promise<void>
   }
 }
 
-/** Installs the CURRENT generation: `<root>/<name>@latest/node_modules/<name>`. */
+/** Writes `<key>/node_modules/<name>/package.json` with raw text. */
+async function writeNodeModulesManifest(key: string, name: string, content: string): Promise<void> {
+  const dir = join(key, "node_modules", ...name.split("/"));
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, "package.json"), content);
+}
+
+/** Installs the CURRENT plugin generation: `<root>/<name>@latest/node_modules/<name>`. */
 async function installPackage(
   root: string,
   name: string,
@@ -34,22 +42,18 @@ async function installPackage(
   await writeCacheManifest(root, name, JSON.stringify(manifest ?? { name, version }));
 }
 
-/** Writes the cache manifest of the current generation as raw text. */
+/** Writes the cache manifest of the current plugin generation as raw text. */
 async function writeCacheManifest(
   root: string,
   name: string,
   content: string,
 ): Promise<void> {
-  const dir = join(root, `${name}@latest`, "node_modules", ...name.split("/"));
-  await mkdir(dir, { recursive: true });
-  await writeFile(join(dir, "package.json"), content);
+  await writeNodeModulesManifest(join(root, `${name}@latest`), name, content);
 }
 
-/** Installs a LEGACY generation dir without the `@latest` key suffix. */
+/** Installs a LEGACY plugin generation dir without the `@latest` key suffix. */
 async function installLegacyGeneration(root: string, name: string, version: string): Promise<void> {
-  const dir = join(root, ...name.split("/"), "node_modules", ...name.split("/"));
-  await mkdir(dir, { recursive: true });
-  await writeFile(join(dir, "package.json"), JSON.stringify({ name, version }));
+  await writeNodeModulesManifest(join(root, ...name.split("/")), name, JSON.stringify({ name, version }));
 }
 
 interface SpyPort {
@@ -463,4 +467,128 @@ test("non-string config entries are ignored defensively", async () => {
 
 test("default registry timeout is ~5s", () => {
   assert.equal(REGISTRY_TIMEOUT_MS, 5000);
+});
+
+/**
+ * Managed Tools fixtures: the Npm.which install path keys the cache dir by
+ * the bare name — `<root>/<tool>/node_modules/<tool>/package.json` — with no
+ * `@latest` suffix (plugin resolver dirs are never reused for tools).
+ */
+async function installTool(root: string, name: string, version: string, manifest?: object): Promise<void> {
+  await writeToolManifest(root, name, JSON.stringify(manifest ?? { name, version }));
+}
+
+/** Writes the manifest of a managed tool as raw text. */
+async function writeToolManifest(root: string, name: string, content: string): Promise<void> {
+  await writeNodeModulesManifest(join(root, name), name, content);
+}
+
+test("known tool set is data and contains the spec's examples", () => {
+  for (const name of [
+    "bash-language-server",
+    "pyright",
+    "typescript-language-server",
+    "yaml-language-server",
+    "prettier",
+    "oxfmt",
+    "@biomejs/biome",
+    "@vue/language-server",
+    "svelte-language-server",
+    "intelephense",
+    "dockerfile-language-server-nodejs",
+    "@astrojs/language-server",
+  ]) {
+    assert.ok(MANAGED_TOOLS.includes(name), name);
+  }
+});
+
+test("managed tools: candidates only for known set ∩ existing cache dirs; foreign dirs never contacted", async () => {
+  await withCacheRoot(async (root) => {
+    await installTool(root, "pyright", "1.1.411");
+    await installTool(root, "prettier", "3.8.4");
+    // Foreign cache content: a git-spec dependency and an unknown package —
+    // neither belongs to the managed set, so neither is checked nor listed.
+    await mkdir(join(root, "superpowers@git+https:"), { recursive: true });
+    await installPackage(root, "left-pad", "1.0.0");
+    const port = spyPort(async () => ({ version: "9.9.9" }));
+    const model = makeModel([], port.fetchLatest, root);
+
+    const result = await model.runCheck();
+
+    assert.deepEqual(
+      result.candidates.map((c) => [c.kind, c.spec]),
+      [
+        ["tool", "pyright"],
+        ["tool", "prettier"],
+      ],
+    );
+    assert.deepEqual([...port.calls].sort(), ["prettier", "pyright"]);
+  });
+});
+
+test("tool candidates take the same version/unknown path as plugins", async () => {
+  await withCacheRoot(async (root) => {
+    await installTool(root, "pyright", "1.1.411");
+    await installTool(root, "bash-language-server", "5.6.0");
+    await writeToolManifest(root, "prettier", "{not json");
+    const port = spyPort(async (name) => {
+      if (name === "bash-language-server") throw new Error("registry: bash-language-server/latest responded 404");
+      return { version: "9.9.9" };
+    });
+    const model = makeModel([], port.fetchLatest, root);
+
+    const result = await model.runCheck();
+
+    // Checked path: installed→latest pair with the update flag.
+    const pyright = candidateBySpec(result, "pyright");
+    assert.equal(pyright.kind, "tool");
+    assert.equal(pyright.status, "checked");
+    assert.equal(pyright.installedVersion, "1.1.411");
+    assert.equal(pyright.latestVersion, "9.9.9");
+    assert.equal(pyright.updateAvailable, true);
+
+    // Registry failure isolates to this candidate's unknown.
+    const bash = candidateBySpec(result, "bash-language-server");
+    assert.equal(bash.kind, "tool");
+    assert.equal(bash.status, "unknown");
+    assert.equal(bash.reason, "registry lookup failed");
+    assert.equal(bash.updateAvailable, undefined);
+
+    // Broken cache manifest → unknown, same as for plugins.
+    const prettier = candidateBySpec(result, "prettier");
+    assert.equal(prettier.status, "unknown");
+    assert.equal(prettier.installedVersion, undefined);
+    assert.equal(prettier.reason, "version not parseable");
+  });
+});
+
+test("machine without a tools cache yields an empty tool category, not an exception", async () => {
+  await withCacheRoot(async (root) => {
+    const port = spyPort(async () => ({ version: "9.9.9" }));
+    const model = makeModel([], port.fetchLatest, join(root, "does-not-exist"));
+
+    const result = await model.runCheck();
+
+    assert.deepEqual(result.candidates, []);
+    assert.deepEqual([...port.calls], []);
+  });
+});
+
+test("mixed cycle: plugins and tools land in one candidate list", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    await installTool(root, "pyright", "1.1.411");
+    const port = spyPort(async () => ({ version: "9.9.9" }));
+    const model = makeModel(["foo"], port.fetchLatest, root);
+
+    const result = await model.runCheck();
+
+    assert.deepEqual(
+      result.candidates.map((c) => [c.kind, c.spec]),
+      [
+        ["plugin", "foo"],
+        ["tool", "pyright"],
+      ],
+    );
+  });
 });

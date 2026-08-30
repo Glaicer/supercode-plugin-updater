@@ -1,14 +1,17 @@
 /**
  * Update Model — the whole check cycle as one seam, created from a
- * `TuiPluginApi`. Classifies effective-config plugin specs, reads installed
- * versions from the package cache, asks the injected registry port for
- * `latest`, and emits ready-to-render Update Candidates plus skipped specs.
+ * `TuiPluginApi`. Classifies effective-config plugin specs, intersects the
+ * known Managed Tool set with existing cache dirs, reads installed versions
+ * from the package cache, asks the injected registry port for `latest`, and
+ * emits ready-to-render Update Candidates plus skipped specs.
  *
  * Registry orchestration lives here so tests can observe it through the seam:
  * every port call is cut by a per-request timeout and flows through a
  * fixed-size pool; a failure of one package (rejection, timeout, unparsable
  * version) isolates to that candidate's `unknown` status and never breaks the
- * cycle. Registry is asked only for packages whose cache dir exists.
+ * cycle. Registry is asked only for installed packages — a floating spec
+ * whose cache dir exists, or a known tool whose cache dir exists. Tools and
+ * plugins share one candidate path; only their cache key dirs differ.
  */
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
 import {
@@ -18,6 +21,7 @@ import {
 } from "./checker.ts";
 import { defaultCacheRoot, createPackageCache, type PackageCache } from "./cache.ts";
 import { classifyPluginSpec } from "./plugins.ts";
+import { MANAGED_TOOLS } from "./tools.ts";
 
 /** Per-request timeout for registry lookups (US 30). */
 export const REGISTRY_TIMEOUT_MS = 5000;
@@ -27,8 +31,11 @@ export const REGISTRY_CONCURRENCY = 4;
 export type UpdateCandidateStatus = "checked" | "pinned" | "unknown";
 
 export interface UpdateCandidate {
-  kind: "plugin";
-  /** The spec exactly as it appeared in the effective config. */
+  kind: "plugin" | "tool";
+  /**
+   * For plugins: the spec exactly as it appeared in the effective config.
+   * For tools: the package name — the spec OpenCode installs it by.
+   */
   spec: string;
   name: string;
   status: UpdateCandidateStatus;
@@ -126,8 +133,8 @@ export function createUpdateModel(api: TuiPluginApi, options: UpdateModelOptions
 
       const classified = specs.map((spec) => ({ spec, classification: classifyPluginSpec(spec) }));
       const skipped: SkippedSpec[] = [];
-      const floating: { spec: string; name: string }[] = [];
       const pinned: UpdateCandidate[] = [];
+      const checkable: { kind: "plugin" | "tool"; spec: string; name: string }[] = [];
 
       for (const { spec, classification } of classified) {
         if (classification.kind === "unsupported") {
@@ -143,19 +150,32 @@ export function createUpdateModel(api: TuiPluginApi, options: UpdateModelOptions
             pinnedVersion: classification.version,
           });
         } else {
-          floating.push({ spec, name: classification.name });
+          checkable.push({ kind: "plugin", spec, name: classification.name });
         }
       }
 
-      const floatingResults = await mapPool(floating, concurrency, async (entry) => {
-        const base = { kind: "plugin" as const, spec: entry.spec, name: entry.name };
+      // US 25: only installed tools are checked — the known set ∩ existing
+      // cache dirs. A known-but-absent name produces no candidate at all,
+      // and foreign cache content is never reached.
+      for (const name of MANAGED_TOOLS) {
+        if (cache.hasTool(name)) checkable.push({ kind: "tool", spec: name, name });
+      }
 
-        if (!cache.has(entry.name)) {
-          // US 25: no registry traffic for packages that are not installed.
+      const checked = await mapPool(checkable, concurrency, async (entry) => {
+        const base = { kind: entry.kind, spec: entry.spec, name: entry.name };
+
+        // US 25: no registry traffic for plugins that are not installed.
+        // (Tools were gated by `hasTool` before the pool: absent known names
+        // produce no candidate at all.)
+        if (entry.kind === "plugin" && !cache.has(entry.name)) {
           return { ...base, status: "unknown" as const, reason: "not in cache" };
         }
 
-        const installedVersion = cache.getInstalledVersion(entry.name);
+        const installedVersion =
+          entry.kind === "tool" ?
+            cache.getInstalledToolVersion(entry.name)
+          : cache.getInstalledVersion(entry.name);
+
         let latestVersion: string | undefined;
         let failed = false;
         try {
@@ -185,9 +205,10 @@ export function createUpdateModel(api: TuiPluginApi, options: UpdateModelOptions
         };
       });
 
-      // Within each status class the config order is preserved; the future
-      // screen groups by class, so global interleaving does not matter.
-      return { candidates: [...pinned, ...floatingResults], skipped };
+      // Within each status class the config/known-set order is preserved;
+      // the future screen groups by kind, so global interleaving does not
+      // matter.
+      return { candidates: [...pinned, ...checked], skipped };
     },
   };
 }
