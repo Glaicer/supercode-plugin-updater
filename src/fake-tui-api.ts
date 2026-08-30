@@ -21,6 +21,11 @@ export interface FakeTuiApi {
   readonly toasts: { variant: string; title?: string; message: string }[];
   /** Callbacks registered via `api.lifecycle.onDispose`, in order. */
   readonly disposeCallbacks: (() => void | Promise<void>)[];
+  /**
+   * The raw kv map behind `api.kv` — for state-prefix observation and
+   * corrupt-state fixtures only; behavior assertions go through the model.
+   */
+  readonly kv: Map<string, unknown>;
 }
 
 function fail(what: string): never {
@@ -164,5 +169,6 @@ export function createFakeTuiApi(initialConfig: Partial<Config> = {}): FakeTuiAp
     },
     toasts,
     disposeCallbacks,
+    kv,
   };
 }

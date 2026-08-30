@@ -12,6 +12,14 @@
  * cycle. Registry is asked only for installed packages — a floating spec
  * whose cache dir exists, or a known tool whose cache dir exists. Tools and
  * plugins share one candidate path; only their cache key dirs differ.
+ *
+ * Cycle policy: a completed cycle (per-package failures isolated to unknowns)
+ * counts as successful and moves `lastCheck` + overwrites `available` in the
+ * machine-global `plugin-updates.*` state, whether auto or manual. Only when
+ * lookups were attempted and every one failed is the registry unreachable —
+ * that cycle does not count: nothing is persisted, the next start retries.
+ * `start()` is the start-time decision: absent or ≥24h-old `lastCheck` runs
+ * one cycle and toasts once when updates exist; a fresh one skips silently.
  */
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
 import {
@@ -21,12 +29,15 @@ import {
 } from "./checker.ts";
 import { defaultCacheRoot, createPackageCache, type PackageCache } from "./cache.ts";
 import { classifyPluginSpec } from "./plugins.ts";
+import { createUpdateState } from "./state.ts";
 import { MANAGED_TOOLS } from "./tools.ts";
 
 /** Per-request timeout for registry lookups (US 30). */
 export const REGISTRY_TIMEOUT_MS = 5000;
 /** Fixed pool size for concurrent registry lookups (US 31). */
 export const REGISTRY_CONCURRENCY = 4;
+/** Minimum period between counted check cycles (US 1). */
+export const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 export type UpdateCandidateStatus = "checked" | "pinned" | "unknown";
 
@@ -63,8 +74,26 @@ export interface CheckResult {
 }
 
 export interface UpdateModel {
-  /** One check cycle. Resolves even when every lookup failed. */
+  /**
+   * One check cycle, ignoring the 24h TTL — the screen's manual refresh. On
+   * a counted cycle it moves `lastCheck` and overwrites `available`; when
+   * the registry is down entirely nothing is persisted. Never toasts — the
+   * result is visible in the open screen.
+   */
   runCheck(): Promise<CheckResult>;
+  /**
+   * The start-time decision (US 1, 3): asynchronous and non-blocking. An
+   * absent or ≥24h-old `lastCheck` runs one cycle and toasts exactly once
+   * when updates exist; a fresh one skips the cycle — and any toast. A
+   * failed cycle (registry down entirely) toasts nothing and persists
+   * nothing, so the next start retries.
+   */
+  start(): Promise<void>;
+  /**
+   * The snapshot of the last successful cycle, read from state without
+   * registry traffic (US 29); `undefined` before the first success.
+   */
+  getSnapshot(): CheckResult | undefined;
 }
 
 export interface UpdateModelOptions {
@@ -76,6 +105,8 @@ export interface UpdateModelOptions {
   timeoutMs?: number;
   /** Pool size for registry lookups; default `REGISTRY_CONCURRENCY`. */
   concurrency?: number;
+  /** Clock for the TTL decision and `lastCheck` stamps; default `Date.now`. */
+  now?: () => number;
 }
 
 /** Runs `fn` over `items` through a fixed-size pool; order is preserved. */
@@ -122,93 +153,138 @@ export function createUpdateModel(api: TuiPluginApi, options: UpdateModelOptions
   const cache: PackageCache = createPackageCache(options.cacheRoot ?? defaultCacheRoot());
   const timeoutMs = options.timeoutMs ?? REGISTRY_TIMEOUT_MS;
   const concurrency = options.concurrency ?? REGISTRY_CONCURRENCY;
+  const state = createUpdateState(api.kv);
+  const now = options.now ?? Date.now;
 
-  return {
-    async runCheck(): Promise<CheckResult> {
-      const entries = api.state.config.plugin;
-      const specs =
-        Array.isArray(entries) ?
-          entries.filter((entry): entry is string => typeof entry === "string")
-        : [];
+  async function runCycle(): Promise<CheckResult> {
+    const entries = api.state.config.plugin;
+    const specs =
+      Array.isArray(entries) ?
+        entries.filter((entry): entry is string => typeof entry === "string")
+      : [];
 
-      const classified = specs.map((spec) => ({ spec, classification: classifyPluginSpec(spec) }));
-      const skipped: SkippedSpec[] = [];
-      const pinned: UpdateCandidate[] = [];
-      const checkable: { kind: "plugin" | "tool"; spec: string; name: string }[] = [];
+    const classified = specs.map((spec) => ({ spec, classification: classifyPluginSpec(spec) }));
+    const skipped: SkippedSpec[] = [];
+    const pinned: UpdateCandidate[] = [];
+    const checkable: { kind: "plugin" | "tool"; spec: string; name: string }[] = [];
 
-      for (const { spec, classification } of classified) {
-        if (classification.kind === "unsupported") {
-          skipped.push({ kind: "plugin", spec, reason: classification.reason });
-        } else if (classification.kind === "pinned") {
-          // Info-only: the badge shows the configured pin. No registry call,
-          // no comparison — by definition there is nothing to update to.
-          pinned.push({
-            kind: "plugin",
-            spec,
-            name: classification.name,
-            status: "pinned",
-            pinnedVersion: classification.version,
-          });
-        } else {
-          checkable.push({ kind: "plugin", spec, name: classification.name });
-        }
+    for (const { spec, classification } of classified) {
+      if (classification.kind === "unsupported") {
+        skipped.push({ kind: "plugin", spec, reason: classification.reason });
+      } else if (classification.kind === "pinned") {
+        // Info-only: the badge shows the configured pin. No registry call,
+        // no comparison — by definition there is nothing to update to.
+        pinned.push({
+          kind: "plugin",
+          spec,
+          name: classification.name,
+          status: "pinned",
+          pinnedVersion: classification.version,
+        });
+      } else {
+        checkable.push({ kind: "plugin", spec, name: classification.name });
+      }
+    }
+
+    // US 25: only installed tools are checked — the known set ∩ existing
+    // cache dirs. A known-but-absent name produces no candidate at all,
+    // and foreign cache content is never reached.
+    for (const name of MANAGED_TOOLS) {
+      if (cache.hasTool(name)) checkable.push({ kind: "tool", spec: name, name });
+    }
+
+    let attempted = 0;
+    let failed = 0;
+    const checked = await mapPool(checkable, concurrency, async (entry) => {
+      const base = { kind: entry.kind, spec: entry.spec, name: entry.name };
+
+      // US 25: no registry traffic for plugins that are not installed.
+      // (Tools were gated by `hasTool` before the pool: absent known names
+      // produce no candidate at all.)
+      if (entry.kind === "plugin" && !cache.has(entry.name)) {
+        return { ...base, status: "unknown" as const, reason: "not in cache" };
       }
 
-      // US 25: only installed tools are checked — the known set ∩ existing
-      // cache dirs. A known-but-absent name produces no candidate at all,
-      // and foreign cache content is never reached.
-      for (const name of MANAGED_TOOLS) {
-        if (cache.hasTool(name)) checkable.push({ kind: "tool", spec: name, name });
+      const installedVersion =
+        entry.kind === "tool" ?
+          cache.getInstalledToolVersion(entry.name)
+        : cache.getInstalledVersion(entry.name);
+
+      attempted++;
+      let latestVersion: string | undefined;
+      let lookupFailed = false;
+      try {
+        latestVersion = (await withTimeout(fetchLatest(entry.name), timeoutMs)).version;
+      } catch {
+        lookupFailed = true;
+        failed++;
       }
 
-      const checked = await mapPool(checkable, concurrency, async (entry) => {
-        const base = { kind: entry.kind, spec: entry.spec, name: entry.name };
-
-        // US 25: no registry traffic for plugins that are not installed.
-        // (Tools were gated by `hasTool` before the pool: absent known names
-        // produce no candidate at all.)
-        if (entry.kind === "plugin" && !cache.has(entry.name)) {
-          return { ...base, status: "unknown" as const, reason: "not in cache" };
-        }
-
-        const installedVersion =
-          entry.kind === "tool" ?
-            cache.getInstalledToolVersion(entry.name)
-          : cache.getInstalledVersion(entry.name);
-
-        let latestVersion: string | undefined;
-        let failed = false;
-        try {
-          latestVersion = (await withTimeout(fetchLatest(entry.name), timeoutMs)).version;
-        } catch {
-          failed = true;
-        }
-
-        const updateAvailable = isUpdateAvailable(installedVersion, latestVersion);
-        if (updateAvailable === undefined) {
-          return {
-            ...base,
-            status: "unknown" as const,
-            installedVersion,
-            latestVersion,
-            reason: failed ? "registry lookup failed" : "version not parseable",
-          };
-        }
-        // `updateAvailable` is defined only when both versions parsed, so
-        // both are strings here — that invariant replaces any assertion.
+      const updateAvailable = isUpdateAvailable(installedVersion, latestVersion);
+      if (updateAvailable === undefined) {
         return {
           ...base,
-          status: "checked" as const,
-          installedVersion: installedVersion as string,
-          latestVersion: latestVersion as string,
-          updateAvailable,
+          status: "unknown" as const,
+          installedVersion,
+          latestVersion,
+          reason: lookupFailed ? "registry lookup failed" : "version not parseable",
         };
-      });
+      }
+      // `updateAvailable` is defined only when both versions parsed, so
+      // both are strings here — that invariant replaces any assertion.
+      return {
+        ...base,
+        status: "checked" as const,
+        installedVersion: installedVersion as string,
+        latestVersion: latestVersion as string,
+        updateAvailable,
+      };
+    });
 
-      // Within each status class the config/known-set order is preserved;
-      // the future screen groups by kind, so global interleaving does not
-      // matter.
-      return { candidates: [...pinned, ...checked], skipped };
+    const result: CheckResult = { candidates: [...pinned, ...checked], skipped };
+
+    // Failure policy: per-package failures isolate to `unknown` above and
+    // the cycle counts as completed. Only when lookups were attempted and
+    // every one of them failed is the registry unreachable as a whole — the
+    // cycle does not count: `lastCheck` and `available` stay, so the next
+    // start retries (US 22, 23).
+    const registryDown = attempted > 0 && failed === attempted;
+    if (!registryDown) {
+      state.setLastCheck(now());
+      state.setAvailable(result);
+    }
+    return result;
+  }
+
+  let inFlightStart: Promise<void> | undefined;
+  return {
+    runCheck: () => runCycle(),
+    start(): Promise<void> {
+      // One auto cycle per model at a time: overlapping starts would share
+      // the same stale `lastCheck` read and toast twice.
+      inFlightStart ??= decideAndCycle().finally(() => {
+        inFlightStart = undefined;
+      });
+      return inFlightStart;
     },
+    getSnapshot: () => state.getAvailable(),
   };
+
+  async function decideAndCycle(): Promise<void> {
+      // The decision is asynchronous (US 3): yield before touching state or
+      // the registry so a synchronous start never blocks or reaches the
+      // network within the caller's tick.
+      await Promise.resolve();
+      const lastCheck = state.getLastCheck();
+      // Fresh (`< 24h`) → skip; absent, corrupt, or ≥24h old → one cycle.
+      if (typeof lastCheck === "number" && now() - lastCheck < CHECK_INTERVAL_MS) return;
+      const result = await runCycle();
+      // Pinned/unknown candidates never carry the flag, and a failed cycle
+      // has only unknowns, so this is also where the "no toast for a failed
+      // cycle" rule lands.
+      const updates = result.candidates.filter((c) => c.updateAvailable === true).length;
+      if (updates > 0) {
+        api.ui.toast({ message: `${updates} OpenCode updates available. Run /plugin-updates to review them.` });
+      }
+  }
 }

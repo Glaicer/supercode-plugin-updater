@@ -5,7 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Config } from "@opencode-ai/sdk/v2";
 import { createNpmRegistryPort, type FetchLatest } from "./checker.ts";
-import { REGISTRY_CONCURRENCY, REGISTRY_TIMEOUT_MS, createUpdateModel, type CheckResult, type UpdateCandidate } from "./update-model.ts";
+import {
+  CHECK_INTERVAL_MS,
+  REGISTRY_CONCURRENCY,
+  REGISTRY_TIMEOUT_MS,
+  createUpdateModel,
+  type CheckResult,
+  type UpdateCandidate,
+} from "./update-model.ts";
 import { createFakeTuiApi } from "./fake-tui-api.ts";
 import { MANAGED_TOOLS } from "./tools.ts";
 
@@ -84,18 +91,44 @@ function spyPort(handler: (name: string) => Promise<{ version: string }>): SpyPo
   };
 }
 
+interface HarnessOptions {
+  specs?: string[];
+  now?: () => number;
+  timeoutMs?: number;
+  concurrency?: number;
+}
+
+/**
+ * One Update Model over a fresh fake api. `build()` re-instantiates the
+ * model over the SAME fake api (same kv) — a new "start", per Testing
+ * Decisions: starts, never timers.
+ */
+function makeHarness(
+  port: FetchLatest,
+  cacheRoot: string,
+  options: HarnessOptions = {},
+): { fake: ReturnType<typeof createFakeTuiApi>; build: () => ReturnType<typeof createUpdateModel> } {
+  const fake = createFakeTuiApi({ plugin: options.specs ?? [] } as Partial<Config>);
+  return {
+    fake,
+    build: () =>
+      createUpdateModel(fake.api, {
+        fetchLatest: port,
+        cacheRoot,
+        now: options.now,
+        timeoutMs: options.timeoutMs,
+        concurrency: options.concurrency,
+      }),
+  };
+}
+
 function makeModel(
   specs: string[],
   port: FetchLatest,
   cacheRoot: string,
   options?: { timeoutMs?: number; concurrency?: number },
-): { runCheck(): Promise<CheckResult> } {
-  const fake = createFakeTuiApi({ plugin: specs } as Partial<Config>);
-  return createUpdateModel(fake.api, {
-    fetchLatest: port,
-    cacheRoot,
-    ...options,
-  });
+): ReturnType<typeof createUpdateModel> {
+  return makeHarness(port, cacheRoot, { specs, ...options }).build();
 }
 
 function candidateBySpec(result: CheckResult, spec: string): UpdateCandidate {
@@ -590,5 +623,265 @@ test("mixed cycle: plugins and tools land in one candidate list", async () => {
         ["tool", "pyright"],
       ],
     );
+  });
+});
+
+/**
+ * Ticket 03: the 24h cycle, machine-global state under `plugin-updates.*`,
+ * and the one-toast-per-cycle rule. Every "start" below is a
+ * re-instantiation of the model over the same fake api (same kv) via
+ * `build()` — no timers, the clock is an injected `now`.
+ */
+const HOUR_MS = 60 * 60 * 1000;
+const TOAST_MESSAGE = (count: number): string =>
+  `${count} OpenCode updates available. Run /plugin-updates to review them.`;
+
+test("first start with no lastCheck runs the cycle and toasts once with the update count", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    await installPackage(root, "bar", "5.0.0");
+    await installTool(root, "pyright", "1.1.411");
+    const port = spyPort(async () => ({ version: "9.9.9" }));
+    const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo", "bar"] });
+
+    await build().start();
+
+    // The counter spans both kinds: two floating plugins + one managed tool.
+    assert.equal(fake.toasts.length, 1);
+    assert.equal(fake.toasts[0]?.message, TOAST_MESSAGE(3));
+  });
+});
+
+test("fresh lastCheck: start skips the cycle — no registry traffic, no toast", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo"] });
+
+    await build().start(); // first start: cycles, toasts
+    assert.equal(fake.toasts.length, 1);
+
+    await build().start(); // repeated start within 24h: no new cycle, no toast
+    assert.deepEqual([...port.calls], ["foo"]);
+    assert.equal(fake.toasts.length, 1);
+  });
+});
+
+test("stale lastCheck — exactly and well past 24h — re-runs the cycle", async () => {
+  await withCacheRoot(async (root) => {
+    let now = 1_000_000;
+    await installPackage(root, "foo", "1.0.0");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo"], now: () => now });
+
+    await build().start();
+    assert.deepEqual([...port.calls], ["foo"]);
+    assert.equal(fake.toasts.length, 1);
+
+    now += CHECK_INTERVAL_MS; // exactly 24h old is already stale (≥24h)
+    await build().start();
+    assert.deepEqual([...port.calls], ["foo", "foo"]);
+    assert.equal(fake.toasts.length, 2); // the next toast comes with the new cycle
+
+    now += CHECK_INTERVAL_MS + HOUR_MS;
+    await build().start();
+    assert.deepEqual([...port.calls], ["foo", "foo", "foo"]);
+    assert.equal(fake.toasts.length, 3);
+  });
+});
+
+test("full registry outage: the cycle does not count — no toast, lastCheck unmoved, next start retries", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    let healthy = false;
+    const port = spyPort(async () => {
+      if (!healthy) throw new Error("registry: network unreachable");
+      return { version: "2.0.0" };
+    });
+    const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo"] });
+
+    await build().start(); // outage: lookup fails, cycle does not count
+    assert.deepEqual(fake.toasts, []);
+    assert.deepEqual([...port.calls], ["foo"]);
+
+    // Had the failed cycle moved lastCheck, this start would have skipped.
+    await build().start();
+    assert.deepEqual([...port.calls], ["foo", "foo"]);
+    assert.deepEqual(fake.toasts, []);
+
+    healthy = true; // registry back: the next start cycles and toasts
+    await build().start();
+    assert.deepEqual([...port.calls], ["foo", "foo", "foo"]);
+    assert.equal(fake.toasts.length, 1);
+  });
+});
+
+test("one package failing among successes: the cycle counts — toast fires, lastCheck moves", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    await installPackage(root, "baz", "1.0.0");
+    const port = spyPort(async (name) => {
+      if (name === "foo") throw new Error("registry: foo/latest responded 404");
+      return { version: "2.0.0" };
+    });
+    const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo", "baz"] });
+
+    await build().start();
+
+    // Only baz carries an update; the failed foo is unknown, not a blocker.
+    assert.deepEqual(fake.toasts.map((t) => t.message), [TOAST_MESSAGE(1)]);
+
+    const next = build(); // lastCheck moved by the counted cycle → skip
+    await next.start();
+    assert.deepEqual([...port.calls], ["foo", "baz"]);
+
+    // The failed package is still visible as unknown in the snapshot.
+    const snapshot = next.getSnapshot();
+    assert.ok(snapshot);
+    assert.equal(candidateBySpec(snapshot, "foo").status, "unknown");
+    assert.equal(candidateBySpec(snapshot, "baz").updateAvailable, true);
+  });
+});
+
+test("manual runCheck ignores TTL, never toasts, and still moves lastCheck", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo"] });
+
+    await build().start(); // fresh lastCheck from the auto cycle
+    assert.equal(fake.toasts.length, 1);
+
+    await build().runCheck(); // manual: TTL ignored → the lookup happens again
+    assert.deepEqual([...port.calls], ["foo", "foo"]);
+    assert.equal(fake.toasts.length, 1); // the result is visible in the screen, not a toast
+
+    // The manual cycle overwrote `available` with its own result.
+    const manualModel = build();
+    const manualSnapshot = manualModel.getSnapshot();
+    assert.ok(manualSnapshot);
+    assert.equal(candidateBySpec(manualSnapshot, "foo").updateAvailable, true);
+
+    await manualModel.start(); // the manual cycle moved lastCheck → skip
+    assert.deepEqual([...port.calls], ["foo", "foo"]);
+    assert.equal(fake.toasts.length, 1);
+  });
+});
+
+test("manual runCheck on a full registry outage does not move lastCheck either", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    const port = spyPort(async () => {
+      throw new Error("registry: network unreachable");
+    });
+    const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo"] });
+
+    const result = await build().runCheck();
+    assert.equal(candidateBySpec(result, "foo").status, "unknown");
+    assert.deepEqual(fake.toasts, []);
+
+    await build().start(); // retry at the next start: lastCheck was not moved
+    assert.deepEqual([...port.calls], ["foo", "foo"]);
+    assert.deepEqual(fake.toasts, []);
+  });
+});
+
+test("empty check universe: the cycle trivially succeeds — no toast, snapshot stored", async () => {
+  await withCacheRoot(async (root) => {
+    const port = spyPort(async () => {
+      throw new Error("no lookups without checkable entries");
+    });
+    const { fake, build } = makeHarness(port.fetchLatest, root);
+
+    const model = build();
+    await model.start();
+
+    assert.deepEqual(fake.toasts, []);
+    const snapshot = model.getSnapshot();
+    assert.ok(snapshot);
+    assert.deepEqual([...snapshot.candidates], []);
+    assert.deepEqual([...snapshot.skipped], []);
+  });
+});
+
+test("getSnapshot serves the last successful cycle from state, without registry traffic", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { build } = makeHarness(port.fetchLatest, root, { specs: ["foo"] });
+
+    assert.equal(build().getSnapshot(), undefined);
+
+    await build().start();
+
+    const revived = build(); // a new "session", same kv
+    const snapshot = revived.getSnapshot();
+    assert.ok(snapshot);
+    assert.equal(candidateBySpec(snapshot, "foo").updateAvailable, true);
+    assert.deepEqual([...port.calls], ["foo"]);
+  });
+});
+
+test("a cycle after the update is applied (cache holds latest) offers nothing and toasts nothing", async () => {
+  await withCacheRoot(async (root) => {
+    let now = 0;
+    await installPackage(root, "foo", "1.0.0");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo"], now: () => now });
+
+    await build().start();
+    assert.equal(fake.toasts.length, 1);
+
+    // Simulated restart + reinstall: the cache now holds the version `latest` had.
+    await installPackage(root, "foo", "2.0.0");
+    now += CHECK_INTERVAL_MS;
+
+    const model = build();
+    await model.start();
+
+    assert.equal(fake.toasts.length, 1);
+    const snapshot = model.getSnapshot();
+    assert.ok(snapshot);
+    assert.equal(candidateBySpec(snapshot, "foo").updateAvailable, false);
+  });
+});
+
+test("start() decides asynchronously — no registry traffic before it yields", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { build } = makeHarness(port.fetchLatest, root, { specs: ["foo"] });
+
+    const started = build().start();
+    assert.deepEqual([...port.calls], []);
+    await started;
+    assert.deepEqual([...port.calls], ["foo"]);
+  });
+});
+
+test("all persisted state lives under the plugin-updates prefix", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo"] });
+
+    await build().start();
+
+    const keys = [...fake.kv.keys()];
+    assert.ok(keys.length >= 2, "a successful cycle persists lastCheck and available");
+    for (const key of keys) assert.ok(key.startsWith("plugin-updates."), key);
+  });
+});
+
+test("a corrupt lastCheck is treated as absent, not as fresh", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo"] });
+
+    fake.kv.set("plugin-updates.lastCheck", "yesterday-ish");
+    await build().start();
+
+    assert.deepEqual([...port.calls], ["foo"]);
   });
 });
