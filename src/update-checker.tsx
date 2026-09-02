@@ -1,36 +1,3 @@
-/**
- * supercode.update-checker — TUI plugin for the Update Checker
- * (feature 041, tickets 05 + 06). This file is the View plus registration
- * only: every bit of check logic lives in ./update-model.ts and the
- * selection rules in ./selection.ts (the tested seams).
- *
- * Registration surface (probe-verified on runtime 1.18.21, see
- * .scratch/041-update-checker/probe/RESULTS.md):
- * - `api.route.register` mounts the `/plugin-updates` screen; `register`
- *   returns an unsubscribe, wired to `lifecycle.onDispose` so a plugin
- *   reload cannot leak a stale route.
- * - `api.keymap.registerLayer` adds the command-palette entry; `slashName`
- *   makes it reachable as `/plugin-updates`. The command only navigates —
- *   the host's own diff-viewer uses the same registerLayer + navigate shape.
- * - The screen binds its keys for as long as it is mounted: the layer is
- *   registered in `onMount` and unregistered in `onCleanup`, so bindings
- *   never fire outside the route. Closing returns to the route the palette
- *   was opened from (home when there is none).
- *
- * Interactivity (ticket 06): Space toggles the row under the cursor,
- * `A` selects every selectable candidate (checked Floating plugins and
- * Managed Tools only — pinned, unknown, and skipped never enter the
- * selection, US 11–13), `U` opens a `ui.DialogConfirm` over the selection
- * and on confirm hands it to `model.confirm` (Pending Invalidation in kv +
- * one prepared toast; nothing on disk until dispose, ADR 0016), `R` runs a
- * manual model cycle ignoring the TTL with no toast, Esc closes.
- *
- * On open the screen renders the stored `available` snapshot from kv
- * immediately — no network wait (US 29). While a check cycle is running
- * (startup or manual), an indicator line shows above the list (US 28); when
- * the cycle settles, the snapshot is re-read and the list updates. After a
- * confirmed update the screen shows a pending-restart banner (US 18).
- */
 /** @jsxImportSource @opentui/solid */
 import { createEffect, createSignal, For, onCleanup, onMount, Show, type JSX } from "solid-js";
 import { TextAttributes } from "@opentui/core";
@@ -50,22 +17,15 @@ const ROUTE_NAME = "plugin-updates";
 /** Selection lists longer than this get the large dialog preset. */
 const LARGE_DIALOG_MAX_ROWS = 6;
 
-/** What the palette command stashes into the route params for Esc (US 14). */
 interface ReturnRouteParams {
   returnRoute?: { name: string; params?: Record<string, unknown> };
 }
 
-/**
- * Where Esc should land: the route the screen was opened from, or home.
- * The palette command stashes `route.current` into the route params (same
- * pattern as the host's diff viewer with its `returnRoute`).
- */
 function goBack(api: TuiPluginApi): void {
   const back = (api.route.current as { params?: ReturnRouteParams }).params?.returnRoute;
   api.route.navigate(back?.name ?? "home", back?.params);
 }
 
-/** One selectable candidate line: cursor marker, checkbox, spec, version pair. */
 function SelectableRow(props: {
   api: TuiPluginApi;
   candidate: UpdateCandidate;
@@ -98,11 +58,6 @@ function SelectableRow(props: {
   );
 }
 
-/**
- * One info-only candidate line — Pinned (badge, US 11) or unknown (status
- * string, US 22). Leading blanks keep the spec column aligned with the
- * checkbox rows; no cursor, no checkbox — never selectable.
- */
 function InfoRow(props: { api: TuiPluginApi; candidate: UpdateCandidate }) {
   const theme = () => props.api.theme.current;
   const c = () => props.candidate;
@@ -141,7 +96,6 @@ function CandidateRow(props: {
   );
 }
 
-/** One skipped-spec line: the spec and why it cannot be checked. */
 function SkippedRow(props: { api: TuiPluginApi; skipped: SkippedSpec }) {
   const theme = () => props.api.theme.current;
   return (
@@ -152,7 +106,6 @@ function SkippedRow(props: { api: TuiPluginApi; skipped: SkippedSpec }) {
   );
 }
 
-/** One group header (Plugins / Managed tools / Skipped) plus its rows. */
 function Group(props: { api: TuiPluginApi; title: string; children: JSX.Element }) {
   const theme = () => props.api.theme.current;
   return (
@@ -170,7 +123,6 @@ function UpdatesScreen(props: {
   model: UpdateModel;
   snapshot: () => CheckResult | undefined;
   checking: () => boolean;
-  /** One manual model cycle (ignores TTL, never toasts) with indicator wiring. */
   refresh: () => Promise<void>;
 }) {
   const theme = () => props.api.theme.current;
@@ -182,8 +134,6 @@ function UpdatesScreen(props: {
   const nothingStored = () => !props.snapshot() && !props.checking();
 
   const selection = createSelection();
-  // The selection store is intentionally unreactive (pure, tested); this
-  // version bump is what makes checkbox reads track mutations.
   const [version, setVersion] = createSignal(0);
   const mutate = (fn: () => void) => {
     fn();
@@ -195,14 +145,11 @@ function UpdatesScreen(props: {
   };
 
   const [cursor, setCursor] = createSignal(0);
-  // A refresh can shrink the list; keep the cursor inside it (or at 0).
   createEffect(() => {
     const length = selectable().length;
     if (cursor() >= length) setCursor(Math.max(0, length - 1));
   });
 
-  // Survives remounts: derived from the model's state machine on mount, so
-  // reopening the screen while updates are pending still shows the banner.
   const [prepared, setPrepared] = createSignal(props.model.state === "pending-restart");
 
   const move = (delta: number) => {
@@ -216,20 +163,14 @@ function UpdatesScreen(props: {
   };
   const selectAll = () => mutate(() => selection.selectAll(candidates()));
   const update = () => {
-    // `U` with nothing selectable marked is a no-op — no dialog, no error.
     if (selection.isEmpty(candidates())) return;
     openConfirm(selection.selectedEntries(candidates()));
   };
   const manualRefresh = () => {
-    // One cycle at a time: a manual R never overlaps the startup cycle or
-    // another R (the model dedupes only start()).
     if (props.checking()) return;
     void props.refresh();
   };
 
-  // Key layer lifecycle: registered while mounted, unregistered while the
-  // confirm dialog is open, so screen keys never race the dialog's own
-  // bindings regardless of how the host scopes layer dispatch.
   let unregisterKeys: (() => void) | undefined;
   let disposed = false;
   const registerKeys = () => {
@@ -263,14 +204,6 @@ function UpdatesScreen(props: {
     unregisterKeys = undefined;
   };
 
-  /**
-   * The confirm dialog (US 17): `ui.DialogConfirm` rendered into the host's
-   * dialog stack via `ui.dialog.replace`. Every path out of the dialog —
-   * confirm, cancel, Esc — fires the `replace` onClose callback (the host
-   * calls it on clear too), so the promise settles through one `finish`
-   * gate: first callback wins, the rest are swallowed. Keys resume via a
-   * microtask, after the dialog's own binding handler has closed it.
-   */
   function openConfirm(entries: readonly PendingEntry[]): void {
     pauseKeys();
     let settled = false;
@@ -296,10 +229,6 @@ function UpdatesScreen(props: {
     if (entries.length > LARGE_DIALOG_MAX_ROWS) props.api.ui.dialog.setSize("large");
   }
 
-  // Bindings live only while this screen is mounted: registered on mount,
-  // unregistered on unmount (also covering the dialog-open window), so they
-  // never leak to other routes — and a mid-dialog unmount cannot have the
-  // queued key resume re-register a dead screen.
   onMount(registerKeys);
   onCleanup(() => {
     disposed = true;
@@ -364,32 +293,21 @@ const tui: TuiPlugin = async (api) => {
   const [snapshot, setSnapshot] = createSignal<CheckResult | undefined>(model.getSnapshot());
   const [checking, setChecking] = createSignal(false);
 
-  // One model cycle wired to the screen indicator: the result lands in the
-  // snapshot when the cycle settles. A failed cycle (registry down
-  // entirely) keeps the previous snapshot — the screen stays usable.
   const refresh = async (): Promise<void> => {
     setChecking(true);
     try {
       await model.runCheck();
     } catch {
-      // Per-package failures isolate to unknown candidates; a total
-      // failure persists nothing — keep showing the previous result.
     } finally {
       setSnapshot(model.getSnapshot());
       setChecking(false);
     }
   };
 
-  // Start-time decision (US 1, 3): asynchronous, never blocks init. The
-  // model yields before touching state or network; the indicator only
-  // tracks the cycle so an open screen shows progress (US 28) and picks up
-  // the fresh snapshot when the cycle settles.
   setChecking(true);
   void model
     .start()
-    .catch(() => {
-      // A failed cycle keeps the previous state; the next start retries.
-    })
+    .catch(() => {})
     .finally(() => {
       setChecking(false);
       setSnapshot(model.getSnapshot());
@@ -401,8 +319,6 @@ const tui: TuiPlugin = async (api) => {
       render: () => <UpdatesScreen api={api} model={model} snapshot={snapshot} checking={checking} refresh={refresh} />,
     },
   ]);
-  // The host tracks plugin-scope disposals itself; this makes the no-leak
-  // guarantee explicit and survives a host that does not.
   api.lifecycle.onDispose(unregisterRoute);
 
   const commandLayer: unknown = api.keymap.registerLayer({

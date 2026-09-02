@@ -1,11 +1,4 @@
-/**
- * The unstable OpenCode cache layout is isolated here. Plugin resolver keys
- * use `<name>@latest`; managed-tool keys use the bare package name. Scoped
- * names create nested directories in both forms.
- *
- * Older plugin generations used a bare-name sibling directory; it must not
- * be read or removed as the current plugin generation.
- */
+
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";

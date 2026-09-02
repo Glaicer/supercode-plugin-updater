@@ -1,8 +1,4 @@
-/**
- * Verified against OpenCode 1.18.25 (2026-08-30): every entry is a literal
- * `Npm.which()` call site in the host. Re-derive this table when that host
- * version changes.
- */
+/** Managed tools installed via `Npm.which()` in the host. */
 export const MANAGED_TOOLS: readonly string[] = [
   "@astrojs/language-server",
   "@vue/language-server",
