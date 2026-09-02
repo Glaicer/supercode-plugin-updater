@@ -1,64 +1,42 @@
-# supercode.update-checker
+# plugin-updater
 
-TUI-плагин OpenCode: раз в 24 часа сверяет установленные npm-плагины из effective
-config и Managed Tools с `latest` в npm registry и показывает, где есть обновления.
-Ничего не ставит и не удаляет сам — только помечает кэш к инвалидации (ADR
-`docs/adr/041-update-checker/0016`).
+An OpenCode plugin that tells you when your plugins and built-in tools have updates waiting, and applies them on the next restart.
 
-## Статус
+## The problem
 
-Реализованы тикеты 01–06 (`.scratch/041-update-checker/issues/`): checker без TUI,
-Managed Tools, 24h-цикл + toast, Pending Invalidation + recovery, каркас TUI-плагина и
-интерактив — выбор по Space/`A`, confirm-dialog перед подготовкой, `R` — ручной цикл без
-TTL. Остаётся ручной smoke полного цикла в живом TUI (гейт закрытия фичи, см. «Проверка»).
+OpenCode installs npm plugins and managed tools (prettier, pyright, bash-language-server, …) into `~/.cache/opencode/packages`, but nothing ever updates them. Whatever version was current when a package was first cached stays there forever. There's no update check, no notification, and no command to update them. The only remedy is manually deleting cache directories.
 
-## Модули
+## What it does
 
-- `src/checker.ts` — контракт registry-порта (`fetchLatest`), дефолтный npm-порт,
-  semver-lite сравнение по тройке major/minor/patch.
-- `src/plugins.ts` — таксономия спеков effective config: Floating (`foo`,
-  `foo@latest`), Pinned (`foo@1.2.3`, registry не спрашивается), Unsupported
-  (локальные пути, `file:`, `git+`, URL, semver-диапазоны, другие dist-теги).
-- `src/cache.ts` — адаптер `PackageCache` над `~/.cache/opencode/packages`:
-  установленная версия из `<key>/node_modules/<name>/package.json`, bare name
-  нормализуется в `name@latest`, scoped-плагин читается из диры текущего
-  резолвера (`@scope/name@latest`), tools — голая дира `<name>`.
-- `src/update-model.ts` — Update Model: единственный автоматизируемый шов. Один
-  цикл проверки: per-request таймаут 5s, пул на 4 параллельных запроса, отказ
-  одного пакета даёт ему статус `unknown` и не срывает цикл; registry опрашивается
-  только за пакетами, чья дира есть в кэше. Подтверждение пишет Pending
-  Invalidation в kv; dispose и recovery дозакрывают его поэлементно.
-- `src/selection.ts` — правила выбора экрана (тестовый шов тикета 06): выбираемы
-  ровно `status: "checked"` кандидаты обоих видов; pinned, unknown и skipped не
-  попадают в выбор ни по Space, ни по `A`.
-- `src/update-checker.tsx` — TUI-плагин (View + регистрация, логики нет):
-  `route.register("plugin-updates")`, команда `Plugin updates` с `slashName:
-  "plugin-updates"` в command palette через `keymap.registerLayer`, стартовый цикл
-  `model.start()` асинхронно при загрузке. Экран: три группы (Plugins / Managed
-  tools / Skipped), сохранённый снапшот из kv сразу при открытии, индикатор идущей
-  проверки, клавиши Space / `A` / `U` / `R` / Esc (плюс `j`/`k` для курсора).
-  `U` открывает `ui.DialogConfirm` со списком выбранных; подтверждение вызывает
-  `model.confirm` (Pending Invalidation в kv + один toast «Updates prepared…»),
-  экран показывает pending-баннер; до dispose файловая система не трогается.
-  `R` — ручной цикл модели, TTL игнорирует, тоста нет; при полном отказе registry
-  список остаётся с предыдущим результатом. Клавиши экрана не активны, пока открыт
-  confirm-dialog.
-- `src/fake-tui-api.ts` — фейковый `TuiPluginApi` для тестов (in-memory kv,
-  effective config, захват toast/dispose; registry — инъекция).
+Once a day (on startup, 24h between checks), it compares the installed version of every plugin and managed tool against `latest` on the npm registry:
 
-## Установка
+- If it finds updates, you get a toast: `N OpenCode updates available. Run /plugin-updates to review them.`
+- `/plugin-updates` (command palette or slash command) opens a screen with three groups (Plugins, Managed tools, Skipped) showing `installed → latest` per package.
+- Select what you want (Space / `A`), press `U`, confirm, and OpenCode installs the fresh versions itself on the next restart.
 
-TUI-плагины директорию `~/.config/opencode/plugins/` сканером не читаются —
-нужны оба шага (проверено в 039: голый симлинк ничего не грузит):
+The plugin never installs or deletes anything directly. Confirming marks the stale cache entries for removal; when OpenCode exits, they're cleaned up and the built-in resolver installs fresh versions on the next start. Until you restart, nothing on disk changes.
 
-1. Симлинк в директорию плагинов:
+Failures are contained: one unreachable package shows as `unknown` and doesn't break the cycle; a total registry outage keeps the last result on screen.
+
+## What gets checked
+
+- Floating plugin specs from your effective config, like `foo` and `foo@latest`.
+- Managed tools: the bundled tools OpenCode installs for you (prettier, pyright, …).
+
+Skipped, with the reason shown on screen: pinned specs (`foo@1.2.3`), local paths, `file:`/`git+`/URL specs, and semver ranges. Those change only when you change them, so updating them automatically makes no sense.
+
+## Install
+
+TUI plugins aren't picked up by the npm plugin scanner, so two steps are needed (both, in this order):
+
+1. Symlink the plugin into the plugins dir:
 
    ```bash
    ln -sfn <repo>/plugins/plugin-updater/src/update-checker.tsx \
      ~/.config/opencode/plugins/update-checker.tsx
    ```
 
-2. Путь в `plugin` массив `~/.config/opencode/tui.json`:
+2. Add the path to the `plugin` array in `~/.config/opencode/tui.json`:
 
    ```jsonc
    {
@@ -66,43 +44,29 @@ TUI-плагины директорию `~/.config/opencode/plugins/` скане
    }
    ```
 
-Сборки нет: `.tsx` транспилируется хостом на лету, правки подхватываются
-перезапуском TUI (US 34, 35).
+No build step: the host transpiles the `.tsx` on the fly. Restart OpenCode to pick up edits.
 
-## Проверка
+## The /plugin-updates screen
+
+<div style={{ display: flex; justify-content: center; flex-wrap: nowrap; }}>
+  <img src="public/plugin-updater-toast.png" alt="update available toast" width=300 />
+  <img src="public/plugin-update-command.png" alt="/plugin-updates command screen" width=300 />
+</div>
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` or arrows | Move the cursor |
+| Space | Toggle the package under the cursor |
+| `A` | Select every selectable package |
+| `U` | Prepare updates for the selection (confirm dialog first) |
+| `R` | Re-check now (ignores the 24h timer, no toast) |
+| Esc | Close |
+
+Pinned, unknown, and skipped rows are shown for information but can never be selected. Confirming shows a pending-restart banner: the marked cache entries are removed when OpenCode exits, and the next start installs the new versions.
+
+## Development
 
 ```bash
 npm run typecheck   # tsc --noEmit
-npm test            # node --test, без сети: registry и кэш (tmpdir) — фикстуры
+npm test            # node --test, network-free: registry and cache are fixtures
 ```
-
-Ручной smoke в живом TUI (не автоматизируется, Testing Decisions):
-
-1. Перезапустить TUI → диалог Plugins (`ctrl+p` → `plugins`) показывает
-   `supercode.update-checker` со статусом `active`; лог без ошибок загрузки.
-2. При наличии обновлений — один toast «N OpenCode updates available…».
-3. `ctrl+p` → `updates` → Enter: экран `/plugin-updates` рендерит сохранённый
-   список сразу (три группы, skipped-спеки с причиной), поверх — индикатор,
-   пока цикл идёт.
-4. Space переключает чекбокс под курсором (`j`/`k`/стрелки — курсор), `A`
-   выделяет все выбираемые; pinned (бейдж `pinned at X.Y.Z`), unknown
-   (строка статуса) и skipped чекбокс не получают.
-5. `U` без выбранных — no-op; с выбранными — confirm-dialog со списком.
-   Отмена (esc/cancel) ничего не пишет; подтверждение — toast «Updates
-   prepared. Restart OpenCode to apply them.», на экране pending-баннер.
-6. `R` — список обновляется без 24ч-ограничения, тоста нет.
-
-Полный цикл «рестарт применяет обновление» (гейт закрытия фичи 041, не гейт
-тестов) — на фикстурном пакете, чтобы не трогать реальные плагины:
-
-1. Положить в кэш фикстурный пакет старой версии:
-   `~/.cache/opencode/packages/<fixture>@latest/node_modules/<fixture>/package.json`
-   с `"version": "0.0.1"`, а в `plugin` массив конфига — спеку `<fixture>`.
-2. Запустить TUI с чистым `plugin-updates.*` в kv → toast про обновления,
-   на экране строка `<fixture>  0.0.1 → <current latest>`.
-3. Выбрать, `U`, подтвердить → toast + pending-баннер; выйти из OpenCode
-   (штатный выход) — дира `~/.cache/opencode/packages/<fixture>@latest`
-   исчезает, остальной кэш не тронут.
-4. Запустить OpenCode снова — штатный резолвер ставит свежую версию пакета.
-5. Открыть экран и нажать `R` (ручной цикл, TTL игнорирует) — предложений по
-   фикстуре нет: версии равны, повторного предложения не будет (US 27).
