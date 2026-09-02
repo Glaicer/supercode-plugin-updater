@@ -1,9 +1,34 @@
 {
-  "name": "@supercode/plugin-updater",
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "@glaicer/supercode-plugin-updater",
   "version": "0.1.0",
-  "private": true,
+  "description": "OpenCode TUI plugin: daily update check for npm plugins and managed tools, with an interactive /plugin-updates screen",
   "type": "module",
-  "description": "OpenCode TUI plugin: daily update check for floating-spec npm plugins (Update Checker, feature 041).",
+  "license": "MIT",
+  "author": "Dmitrii Aronov <aronov.mml@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Glaicer/supercode-plugin-updater.git"
+  },
+  "homepage": "https://github.com/Glaicer/supercode-plugin-updater#readme",
+  "bugs": "https://github.com/Glaicer/supercode-plugin-updater/issues",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "tui-plugin",
+    "plugin-updater"
+  ],
+  "exports": {
+    "./tui": "./src/update-checker.tsx"
+  },
+  "files": [
+    "src",
+    "!src/*.test.ts",
+    "!src/fake-tui-api.ts"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "test": "node --test 'src/**/*.test.ts'",
     "typecheck": "tsc --noEmit"

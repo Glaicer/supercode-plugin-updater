@@ -1,8 +1,7 @@
 # plugin-updater
 
 <div style={{ display: flex; justify-content: center; flex-wrap: nowrap; }}>
-  <img src="public/plugin-updater-toast.png" alt="update available toast" width=600 />
-  <img src="public/plugin-update-command.png" alt="/plugin-updates command screen" width=600 />
+  <img src="public/plugin-updater.gif" alt="plugin-updater demo" width=800 />
 </div>
 
 An OpenCode plugin that tells you when your plugins and built-in tools have updates waiting, and applies them on the next restart.
@@ -32,24 +31,23 @@ Skipped, with the reason shown on screen: pinned specs (`foo@1.2.3`), local path
 
 ## Install
 
-TUI plugins aren't picked up by the npm plugin scanner, so two steps are needed (both, in this order):
+Install with the OpenCode CLI — it detects the TUI target and registers the plugin in `tui.json` for you:
 
-1. Symlink the plugin into the plugins dir:
+```bash
+opencode plugin @glaicer/supercode-plugin-updater
+```
 
-   ```bash
-   ln -sfn <repo>/plugins/plugin-updater/src/update-checker.tsx \
-     ~/.config/opencode/plugins/update-checker.tsx
-   ```
+- `--global` installs into the global config (`~/.config/opencode`); default is local (`.opencode` in the current project).
+- `--force` replaces an already-installed version.
+- Restart OpenCode after installing.
 
-2. Add the path to the `plugin` array in `~/.config/opencode/tui.json`:
+Manual install also works: add the package to the `plugin` array in `tui.json` (global `~/.config/opencode/tui.json` or local `<project>/.opencode/tui.json`):
 
-   ```jsonc
-   {
-     "plugin": ["/home/<user>/.config/opencode/plugins/update-checker.tsx"]
-   }
-   ```
-
-No build step: the host transpiles the `.tsx` on the fly. Restart OpenCode to pick up edits.
+```jsonc
+{
+  "plugin": ["@glaicer/supercode-plugin-updater"]
+}
+```
 
 | Key | Action |
 | --- | --- |
