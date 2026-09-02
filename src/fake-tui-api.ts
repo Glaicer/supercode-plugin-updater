@@ -2,29 +2,16 @@ import type { Config } from "@opencode-ai/sdk/v2";
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
 
 /**
- * Fake TuiPluginApi for Update Model tests: in-memory kv, effective config,
- * captured toasts and dispose callbacks, throwing stubs for everything the
- * model never touches. Typed against the published @opencode-ai/plugin
- * surface, so an API drift fails HERE, on typecheck.
- *
- * Shortcut (deliberate): renderer/keymap/client/theme and every
- * renderer-adjacent field are identity stubs behind one narrow cast — the
- * model depends on none of them; their internal shape drifting cannot break
- * this plugin until it starts using them.
+ * Typed against the published API so host API drift fails during typecheck.
+ * Renderer-adjacent fields are deliberately narrow casts because the model
+ * never touches them.
  */
 
 export interface FakeTuiApi {
   api: TuiPluginApi;
-  /** Mutates the effective config the model reads from `api.state.config`. */
   setConfig(config: Partial<Config>): void;
-  /** Toasts recorded here instead of going to a UI. */
   readonly toasts: { variant: string; title?: string; message: string }[];
-  /** Callbacks registered via `api.lifecycle.onDispose`, in order. */
   readonly disposeCallbacks: (() => void | Promise<void>)[];
-  /**
-   * The raw kv map behind `api.kv` — for state-prefix observation and
-   * corrupt-state fixtures only; behavior assertions go through the model.
-   */
   readonly kv: Map<string, unknown>;
 }
 
@@ -100,7 +87,6 @@ export function createFakeTuiApi(initialConfig: Partial<Config> = {}): FakeTuiAp
         return true;
       },
       get config() {
-        // The effective (merged global + project) config as a plain object.
         return config as Config;
       },
       provider: [],
@@ -144,8 +130,6 @@ export function createFakeTuiApi(initialConfig: Partial<Config> = {}): FakeTuiAp
         };
       },
     },
-    // Unused host giants below: identity stubs behind narrow casts. The
-    // top-level shape stays checked by the TuiPluginApi annotation above.
     keymap: {} as TuiPluginApi["keymap"],
     renderer: {} as TuiPluginApi["renderer"],
     client: {} as TuiPluginApi["client"],

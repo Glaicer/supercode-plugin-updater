@@ -17,13 +17,6 @@ import {
 import { createFakeTuiApi } from "./fake-tui-api.ts";
 import { MANAGED_TOOLS } from "./tools.ts";
 
-/**
- * Every test runs the single seam — the Update Model under a fake
- * TuiPluginApi — against a REAL tmpdir package cache. No network: the
- * registry is always an injected port. Assertions read what the model emits
- * for rendering, never internals (spec: Testing Decisions).
- */
-
 async function withCacheRoot(fn: (root: string) => Promise<void>): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), "plugin-updater-test-"));
   try {
@@ -33,14 +26,12 @@ async function withCacheRoot(fn: (root: string) => Promise<void>): Promise<void>
   }
 }
 
-/** Writes `<key>/node_modules/<name>/package.json` with raw text. */
 async function writeNodeModulesManifest(key: string, name: string, content: string): Promise<void> {
   const dir = join(key, "node_modules", ...name.split("/"));
   await mkdir(dir, { recursive: true });
   await writeFile(join(dir, "package.json"), content);
 }
 
-/** Installs the CURRENT plugin generation: `<root>/<name>@latest/node_modules/<name>`. */
 async function installPackage(
   root: string,
   name: string,
@@ -50,7 +41,6 @@ async function installPackage(
   await writeCacheManifest(root, name, JSON.stringify(manifest ?? { name, version }));
 }
 
-/** Writes the cache manifest of the current plugin generation as raw text. */
 async function writeCacheManifest(
   root: string,
   name: string,
@@ -59,7 +49,6 @@ async function writeCacheManifest(
   await writeNodeModulesManifest(join(root, `${name}@latest`), name, content);
 }
 
-/** Installs a LEGACY plugin generation dir without the `@latest` key suffix. */
 async function installLegacyGeneration(root: string, name: string, version: string): Promise<void> {
   await writeNodeModulesManifest(join(root, ...name.split("/")), name, JSON.stringify({ name, version }));
 }
@@ -99,11 +88,6 @@ interface HarnessOptions {
   concurrency?: number;
 }
 
-/**
- * One Update Model over a fresh fake api. `build()` re-instantiates the
- * model over the SAME fake api (same kv) — a new "start", per Testing
- * Decisions: starts, never timers.
- */
 function makeHarness(
   port: FetchLatest,
   cacheRoot: string,
@@ -181,21 +165,18 @@ test("three categories: floating checked, pinned info-only without registry, uns
 
     const result = await model.runCheck();
 
-    // Floating: checked with the version pair and flag.
     const foo = candidateBySpec(result, "foo");
     assert.equal(foo.status, "checked");
     assert.equal(foo.installedVersion, "1.0.0");
     assert.equal(foo.latestVersion, "2.0.0");
     assert.equal(foo.updateAvailable, true);
 
-    // Pinned: info-only, the badge version comes from the spec itself.
     const bar = candidateBySpec(result, "bar@1.2.3");
     assert.equal(bar.status, "pinned");
     assert.equal(bar.pinnedVersion, "1.2.3");
     assert.equal(bar.latestVersion, undefined);
     assert.equal(bar.updateAvailable, undefined);
 
-    // Unsupported: skipped with a reason, absent from candidates.
     assert.deepEqual(result.skipped, [
       { kind: "plugin", spec: "./local-plugin", reason: "local path" },
       { kind: "plugin", spec: "file:./local.tgz", reason: "file path" },
@@ -206,7 +187,6 @@ test("three categories: floating checked, pinned info-only without registry, uns
       assert.ok(!result.candidates.some((c) => c.spec === spec), spec);
     }
 
-    // The port spy confirms zero requests beyond the single floating spec.
     assert.deepEqual([...port.calls], ["foo"]);
   });
 });
@@ -256,11 +236,8 @@ test("scoped package with two generations reads the current resolver dir", async
 
 test("missing, garbage, and versionless cache manifests give unknown, not an exception", async () => {
   await withCacheRoot(async (root) => {
-    // Dir exists but no package.json at all.
     await mkdir(join(root, "no-manifest@latest", "node_modules", "no-manifest"), { recursive: true });
-    // Unparsable manifest.
     await writeCacheManifest(root, "garbage", "{not json");
-    // Manifest without a string version.
     await installPackage(root, "versionless", "", { name: "versionless", version: 3 });
     const port = spyPort(async (name) => ({ version: `2.0.0-for-${name}` }));
     const model = makeModel(["no-manifest", "garbage", "versionless"], port.fetchLatest, root);
@@ -273,7 +250,6 @@ test("missing, garbage, and versionless cache manifests give unknown, not an exc
       assert.equal(candidate.installedVersion, undefined, spec);
       assert.equal(candidate.updateAvailable, undefined, spec);
     }
-    // The dirs exist, so the registry was still asked for every one of them.
     assert.deepEqual([...port.calls].sort(), ["garbage", "no-manifest", "versionless"]);
   });
 });
@@ -347,7 +323,6 @@ test("default registry port over frozen JSON fixtures: 200, 404, and garbage JSO
       ["gone", () => new Response("Not Found", { status: 404 })],
       ["junk", () => new Response("<html>not json</html>", { status: 200 })],
     ]);
-    // The real default port parses frozen JSON fixtures — no network.
     const port = createNpmRegistryPort({
       fetchImpl: async (url) => {
         const name = decodeURIComponent(/\/([^/]+)\/latest$/.exec(String(url))![1]!);
@@ -503,16 +478,10 @@ test("default registry timeout is ~5s", () => {
   assert.equal(REGISTRY_TIMEOUT_MS, 5000);
 });
 
-/**
- * Managed Tools fixtures: the Npm.which install path keys the cache dir by
- * the bare name — `<root>/<tool>/node_modules/<tool>/package.json` — with no
- * `@latest` suffix (plugin resolver dirs are never reused for tools).
- */
 async function installTool(root: string, name: string, version: string, manifest?: object): Promise<void> {
   await writeToolManifest(root, name, JSON.stringify(manifest ?? { name, version }));
 }
 
-/** Writes the manifest of a managed tool as raw text. */
 async function writeToolManifest(root: string, name: string, content: string): Promise<void> {
   await writeNodeModulesManifest(join(root, name), name, content);
 }
@@ -540,8 +509,6 @@ test("managed tools: candidates only for known set ∩ existing cache dirs; fore
   await withCacheRoot(async (root) => {
     await installTool(root, "pyright", "1.1.411");
     await installTool(root, "prettier", "3.8.4");
-    // Foreign cache content: a git-spec dependency and an unknown package —
-    // neither belongs to the managed set, so neither is checked nor listed.
     await mkdir(join(root, "superpowers@git+https:"), { recursive: true });
     await installPackage(root, "left-pad", "1.0.0");
     const port = spyPort(async () => ({ version: "9.9.9" }));
@@ -573,7 +540,6 @@ test("tool candidates take the same version/unknown path as plugins", async () =
 
     const result = await model.runCheck();
 
-    // Checked path: installed→latest pair with the update flag.
     const pyright = candidateBySpec(result, "pyright");
     assert.equal(pyright.kind, "tool");
     assert.equal(pyright.status, "checked");
@@ -581,14 +547,12 @@ test("tool candidates take the same version/unknown path as plugins", async () =
     assert.equal(pyright.latestVersion, "9.9.9");
     assert.equal(pyright.updateAvailable, true);
 
-    // Registry failure isolates to this candidate's unknown.
     const bash = candidateBySpec(result, "bash-language-server");
     assert.equal(bash.kind, "tool");
     assert.equal(bash.status, "unknown");
     assert.equal(bash.reason, "registry lookup failed");
     assert.equal(bash.updateAvailable, undefined);
 
-    // Broken cache manifest → unknown, same as for plugins.
     const prettier = candidateBySpec(result, "prettier");
     assert.equal(prettier.status, "unknown");
     assert.equal(prettier.installedVersion, undefined);
@@ -627,12 +591,6 @@ test("mixed cycle: plugins and tools land in one candidate list", async () => {
   });
 });
 
-/**
- * Ticket 03: the 24h cycle, machine-global state under `plugin-updates.*`,
- * and the one-toast-per-cycle rule. Every "start" below is a
- * re-instantiation of the model over the same fake api (same kv) via
- * `build()` — no timers, the clock is an injected `now`.
- */
 const HOUR_MS = 60 * 60 * 1000;
 const TOAST_MESSAGE = (count: number): string =>
   `${count} OpenCode updates available. Run /plugin-updates to review them.`;
@@ -647,7 +605,6 @@ test("first start with no lastCheck runs the cycle and toasts once with the upda
 
     await build().start();
 
-    // The counter spans both kinds: two floating plugins + one managed tool.
     assert.equal(fake.toasts.length, 1);
     assert.equal(fake.toasts[0]?.message, TOAST_MESSAGE(3));
   });
@@ -659,10 +616,10 @@ test("fresh lastCheck: start skips the cycle — no registry traffic, no toast",
     const port = spyPort(async () => ({ version: "2.0.0" }));
     const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo"] });
 
-    await build().start(); // first start: cycles, toasts
+    await build().start();
     assert.equal(fake.toasts.length, 1);
 
-    await build().start(); // repeated start within 24h: no new cycle, no toast
+    await build().start();
     assert.deepEqual([...port.calls], ["foo"]);
     assert.equal(fake.toasts.length, 1);
   });
@@ -679,10 +636,10 @@ test("stale lastCheck — exactly and well past 24h — re-runs the cycle", asyn
     assert.deepEqual([...port.calls], ["foo"]);
     assert.equal(fake.toasts.length, 1);
 
-    now += CHECK_INTERVAL_MS; // exactly 24h old is already stale (≥24h)
+    now += CHECK_INTERVAL_MS;
     await build().start();
     assert.deepEqual([...port.calls], ["foo", "foo"]);
-    assert.equal(fake.toasts.length, 2); // the next toast comes with the new cycle
+    assert.equal(fake.toasts.length, 2);
 
     now += CHECK_INTERVAL_MS + HOUR_MS;
     await build().start();
@@ -701,16 +658,15 @@ test("full registry outage: the cycle does not count — no toast, lastCheck unm
     });
     const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo"] });
 
-    await build().start(); // outage: lookup fails, cycle does not count
+    await build().start();
     assert.deepEqual(fake.toasts, []);
     assert.deepEqual([...port.calls], ["foo"]);
 
-    // Had the failed cycle moved lastCheck, this start would have skipped.
     await build().start();
     assert.deepEqual([...port.calls], ["foo", "foo"]);
     assert.deepEqual(fake.toasts, []);
 
-    healthy = true; // registry back: the next start cycles and toasts
+    healthy = true;
     await build().start();
     assert.deepEqual([...port.calls], ["foo", "foo", "foo"]);
     assert.equal(fake.toasts.length, 1);
@@ -729,14 +685,12 @@ test("one package failing among successes: the cycle counts — toast fires, las
 
     await build().start();
 
-    // Only baz carries an update; the failed foo is unknown, not a blocker.
     assert.deepEqual(fake.toasts.map((t) => t.message), [TOAST_MESSAGE(1)]);
 
-    const next = build(); // lastCheck moved by the counted cycle → skip
+    const next = build();
     await next.start();
     assert.deepEqual([...port.calls], ["foo", "baz"]);
 
-    // The failed package is still visible as unknown in the snapshot.
     const snapshot = next.getSnapshot();
     assert.ok(snapshot);
     assert.equal(candidateBySpec(snapshot, "foo").status, "unknown");
@@ -750,20 +704,19 @@ test("manual runCheck ignores TTL, never toasts, and still moves lastCheck", asy
     const port = spyPort(async () => ({ version: "2.0.0" }));
     const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo"] });
 
-    await build().start(); // fresh lastCheck from the auto cycle
+    await build().start();
     assert.equal(fake.toasts.length, 1);
 
-    await build().runCheck(); // manual: TTL ignored → the lookup happens again
+    await build().runCheck();
     assert.deepEqual([...port.calls], ["foo", "foo"]);
-    assert.equal(fake.toasts.length, 1); // the result is visible in the screen, not a toast
+    assert.equal(fake.toasts.length, 1);
 
-    // The manual cycle overwrote `available` with its own result.
     const manualModel = build();
     const manualSnapshot = manualModel.getSnapshot();
     assert.ok(manualSnapshot);
     assert.equal(candidateBySpec(manualSnapshot, "foo").updateAvailable, true);
 
-    await manualModel.start(); // the manual cycle moved lastCheck → skip
+    await manualModel.start();
     assert.deepEqual([...port.calls], ["foo", "foo"]);
     assert.equal(fake.toasts.length, 1);
   });
@@ -781,7 +734,7 @@ test("manual runCheck on a full registry outage does not move lastCheck either",
     assert.equal(candidateBySpec(result, "foo").status, "unknown");
     assert.deepEqual(fake.toasts, []);
 
-    await build().start(); // retry at the next start: lastCheck was not moved
+    await build().start();
     assert.deepEqual([...port.calls], ["foo", "foo"]);
     assert.deepEqual(fake.toasts, []);
   });
@@ -815,7 +768,7 @@ test("getSnapshot serves the last successful cycle from state, without registry 
 
     await build().start();
 
-    const revived = build(); // a new "session", same kv
+    const revived = build();
     const snapshot = revived.getSnapshot();
     assert.ok(snapshot);
     assert.equal(candidateBySpec(snapshot, "foo").updateAvailable, true);
@@ -833,7 +786,6 @@ test("a cycle after the update is applied (cache holds latest) offers nothing an
     await build().start();
     assert.equal(fake.toasts.length, 1);
 
-    // Simulated restart + reinstall: the cache now holds the version `latest` had.
     await installPackage(root, "foo", "2.0.0");
     now += CHECK_INTERVAL_MS;
 
@@ -887,16 +839,8 @@ test("a corrupt lastCheck is treated as absent, not as fresh", async () => {
   });
 });
 
-/**
- * Ticket 04: Pending Invalidation — confirm marks the confirmed `{kind,
- * spec}` list in kv and toasts once; the filesystem only changes when the
- * captured dispose callback (or recovery at the next start) consumes the
- * marker. Every "start" below is a re-instantiation over the same fake api
- * (same kv), per Testing Decisions.
- */
 const PENDING_KEY = "plugin-updates.pending";
 const PREPARED_TOAST = "Updates prepared. Restart OpenCode to apply them.";
-/** chmod-based failure fixtures need real permission checks (no root). */
 const SKIP_AS_ROOT =
   typeof process.getuid === "function" && process.getuid() === 0 ? "permission fixtures require a non-root user" : false;
 
@@ -919,7 +863,6 @@ test("confirm writes the pending marker, toasts exactly once, and touches no fil
     ]);
     assert.deepEqual(fake.toasts.map((t) => t.message), [PREPARED_TOAST]);
     assert.equal(model.state, "pending-restart");
-    // Nothing on disk before dispose (US 7, 18, 19).
     assert.ok(existsSync(join(root, "foo@latest")));
     assert.ok(existsSync(join(root, "pyright")));
   });
@@ -959,7 +902,6 @@ test("the captured dispose callback removes only the selected packages' dirs", a
 
     assert.ok(!existsSync(join(root, "foo@latest")));
     assert.ok(!existsSync(join(root, "pyright")));
-    // Foreign dirs and the cache root stay untouched (US 26).
     assert.ok(existsSync(join(root, "bar@latest")));
     assert.ok(existsSync(join(root, "left-pad@latest")));
     assert.ok(existsSync(join(root, "prettier")));
@@ -981,8 +923,6 @@ test("consumption is element-wise: a failed dir keeps its marker entry, the rest
       { kind: "plugin", spec: "baz" },
     ]);
 
-    // A read-only key dir makes the removal fail (EACCES); dispose is
-    // best-effort and must not throw (US 21).
     const doomed = join(root, "baz@latest");
     await chmod(doomed, 0o500);
     try {
@@ -993,7 +933,6 @@ test("consumption is element-wise: a failed dir keeps its marker entry, the rest
 
     assert.ok(!existsSync(join(root, "foo@latest")));
     assert.ok(existsSync(doomed));
-    // The consumed entry is erased element-wise; the failed one stays.
     assert.deepEqual(fake.kv.get(PENDING_KEY), [{ kind: "plugin", spec: "baz" }]);
     assert.equal(model.state, "cache-invalidated");
   });
@@ -1041,16 +980,15 @@ test("recovery: a new start over the same kv drains pending before the 24h decis
     const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo"] });
 
     const first = build();
-    await first.start(); // counted cycle: toast + fresh lastCheck
+    await first.start();
     assert.equal(fake.toasts.length, 1);
     first.confirm([{ kind: "plugin", spec: "foo" }]);
 
-    await build().start(); // recovery drains; lastCheck still fresh → no cycle
+    await build().start();
 
     assert.ok(!existsSync(join(root, "foo@latest")));
     assert.equal(fake.kv.get(PENDING_KEY), null);
-    assert.deepEqual([...port.calls], ["foo"]); // no second cycle
-    // The drain emits nothing: still one cycle toast + the prepared one.
+    assert.deepEqual([...port.calls], ["foo"]);
     assert.deepEqual(
       fake.toasts.map((t) => t.message),
       [TOAST_MESSAGE(1), PREPARED_TOAST],
@@ -1064,23 +1002,19 @@ test("recovery runs before the cycle: the drained package is already gone when t
     const port = spyPort(async () => ({ version: "2.0.0" }));
     const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo"] });
 
-    build().confirm([{ kind: "plugin", spec: "foo" }]); // no lastCheck at all
+    build().confirm([{ kind: "plugin", spec: "foo" }]);
 
     const revived = build();
-    await revived.start(); // drain FIRST, then the absent lastCheck → cycle
+    await revived.start();
 
     assert.ok(!existsSync(join(root, "foo@latest")));
     assert.equal(fake.kv.get(PENDING_KEY), null);
-    // The cycle ran after the drain: foo's dir is gone → unknown "not in
-    // cache" with zero registry traffic; no updates, no toast.
     const snapshot = revived.getSnapshot();
     assert.ok(snapshot);
     const foo = candidateBySpec(snapshot, "foo");
     assert.equal(foo.status, "unknown");
     assert.equal(foo.reason, "not in cache");
     assert.deepEqual([...port.calls], []);
-    // The only toast is the confirm's prepared one — recovery and the
-    // post-drain cycle added none.
     assert.deepEqual(fake.toasts.map((t) => t.message), [PREPARED_TOAST]);
   });
 });
@@ -1095,7 +1029,7 @@ test("a cycle result cannot un-confirm: a manual check with updates keeps pendin
     model.confirm([{ kind: "plugin", spec: "foo" }]);
     assert.equal(model.state, "pending-restart");
 
-    await model.runCheck(); // still finds updates
+    await model.runCheck();
     assert.equal(model.state, "pending-restart");
   });
 });
@@ -1109,8 +1043,6 @@ test("re-confirming merges into the marker: earlier selections survive until con
     const model = build();
 
     model.confirm([{ kind: "plugin", spec: "foo" }]);
-    // Second confirm re-offers foo and adds bar: the marker must hold both,
-    // foo only once — overwriting would silently drop the first selection.
     model.confirm([
       { kind: "plugin", spec: "bar" },
       { kind: "plugin", spec: "foo" },
@@ -1120,7 +1052,6 @@ test("re-confirming merges into the marker: earlier selections survive until con
       { kind: "plugin", spec: "foo" },
       { kind: "plugin", spec: "bar" },
     ]);
-    // Exactly one prepared toast per confirm.
     assert.deepEqual(fake.toasts.map((t) => t.message), [PREPARED_TOAST, PREPARED_TOAST]);
 
     await fake.disposeCallbacks[0]!();
@@ -1142,14 +1073,12 @@ test("pending never leaks: marker entries are not candidates and add no toasts",
 
     model.confirm([
       { kind: "plugin", spec: "foo" },
-      { kind: "plugin", spec: "ghost" }, // marked, but in neither config nor cache
+      { kind: "plugin", spec: "ghost" },
     ]);
     assert.deepEqual(fake.toasts.map((t) => t.message), [TOAST_MESSAGE(1), PREPARED_TOAST]);
 
     const result = await model.runCheck();
     assert.ok(!result.candidates.some((c) => c.spec === "ghost"));
-    // Still exactly the two toasts: pending inflates neither the candidate
-    // list nor the toast counter.
     assert.deepEqual(fake.toasts.map((t) => t.message), [TOAST_MESSAGE(1), PREPARED_TOAST]);
   });
 });
@@ -1173,8 +1102,6 @@ test("state machine: full circle idle → updates-available → pending-restart 
     ]);
     assert.equal(model.state, "pending-restart");
 
-    // A partial dispose: baz's dir fails, so invalidation is not complete
-    // and the machine holds cache-invalidated with baz's entry intact.
     const doomed = join(root, "baz@latest");
     await chmod(doomed, 0o500);
     try {
@@ -1187,8 +1114,6 @@ test("state machine: full circle idle → updates-available → pending-restart 
     assert.equal(model.state, "cache-invalidated");
     assert.deepEqual(fake.kv.get(PENDING_KEY), [{ kind: "plugin", spec: "baz" }]);
 
-    // The retry is recovery at the next start over the same kv: it finishes
-    // the drain and the machine comes full circle.
     const revived = build();
     await revived.start();
     assert.ok(!existsSync(doomed));

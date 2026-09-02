@@ -3,13 +3,6 @@ import test from "node:test";
 import { createSelection, isSelectable } from "./selection.ts";
 import type { UpdateCandidate } from "./update-model.ts";
 
-/**
- * Selection rules for the interactive screen (ticket 06). Pure store, no
- * renderer: the checkbox-able class is exactly the candidates the cycle
- * checked against the registry; pinned, unknown, and skipped are never
- * selectable — not by Space, not by `A`.
- */
-
 function checked(kind: "plugin" | "tool", spec: string, update: boolean): UpdateCandidate {
   return {
     kind,
@@ -114,7 +107,6 @@ test("a selection stale after a refresh counts as empty and drops from entries",
   selection.toggle(foo);
   assert.equal(selection.isEmpty([foo]), false);
 
-  // Refresh replaced the list: foo is gone, qux appeared.
   const qux = checked("plugin", "qux", true);
   assert.equal(selection.isEmpty([qux]), true);
   assert.deepEqual(selection.selectedEntries([qux]), []);
