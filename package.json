@@ -34,9 +34,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "1.17.8",
-    "@opentui/core": "0.3.4",
-    "@opentui/solid": "0.3.4",
+    "@opencode-ai/plugin": ">=1.17.8",
+    "@opentui/core": ">=0.4.5",
+    "@opentui/solid": ">=0.4.5",
     "solid-js": "1.9.12"
   },
   "devDependencies": {
@@ -45,6 +45,7 @@
     "typescript": "5.8.2"
   },
   "engines": {
-    "node": ">=24"
+    "node": ">=24",
+    "opencode": ">=1.17.8"
   }
 }
