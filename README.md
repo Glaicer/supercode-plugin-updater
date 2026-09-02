@@ -1,8 +1,9 @@
 # plugin-updater
 
-<div style={{ display: flex; justify-content: center; flex-wrap: nowrap; }}>
+<p>
   <img src="public/plugin-updater.gif" alt="plugin-updater demo" width=800 />
-</div>
+</p>
+<br />
 
 An OpenCode plugin that tells you when your plugins and built-in tools have updates waiting, and applies them on the next restart.
 
@@ -48,6 +49,9 @@ Manual install also works: add the package to the `plugin` array in `tui.json` (
   "plugin": ["@glaicer/supercode-plugin-updater"]
 }
 ```
+
+> [!IMPORTANT]
+> **The first OpenCode load after installing this plugin may be slow.** That's OpenCode downloading the plugin's packages and managed tools into its cache — it happens once. Every subsequent start is fast.
 
 | Key | Action |
 | --- | --- |
