@@ -1,5 +1,10 @@
 # plugin-updater
 
+<div style={{ display: flex; justify-content: center; flex-wrap: nowrap; }}>
+  <img src="public/plugin-updater-toast.png" alt="update available toast" width=600 />
+  <img src="public/plugin-update-command.png" alt="/plugin-updates command screen" width=600 />
+</div>
+
 An OpenCode plugin that tells you when your plugins and built-in tools have updates waiting, and applies them on the next restart.
 
 ## The problem
@@ -45,13 +50,6 @@ TUI plugins aren't picked up by the npm plugin scanner, so two steps are needed 
    ```
 
 No build step: the host transpiles the `.tsx` on the fly. Restart OpenCode to pick up edits.
-
-## The /plugin-updates screen
-
-<div style={{ display: flex; justify-content: center; flex-wrap: nowrap; }}>
-  <img src="public/plugin-updater-toast.png" alt="update available toast" width=300 />
-  <img src="public/plugin-update-command.png" alt="/plugin-updates command screen" width=300 />
-</div>
 
 | Key | Action |
 | --- | --- |
