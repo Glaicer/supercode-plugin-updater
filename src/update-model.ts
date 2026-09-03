@@ -122,6 +122,10 @@ function collectPluginSpecs(api: TuiPluginApi): string[] {
   return merged;
 }
 
+function sameSpecs(a: readonly string[] | undefined, b: readonly string[]): boolean {
+  return a !== undefined && a.length === b.length && a.every((spec, index) => spec === b[index]);
+}
+
 async function mapPool<Item, Result>(
   items: readonly Item[],
   limit: number,
@@ -245,6 +249,7 @@ export function createUpdateModel(api: TuiPluginApi, options: UpdateModelOptions
     if (!registryDown) {
       state.setLastCheck(now());
       state.setAvailable(result);
+      state.setCheckedPluginSpecs(specs);
     }
     // A later check must not undo a confirmed or partially consumed marker.
     if (modelState === "idle" || modelState === "updates-available") {
@@ -327,7 +332,12 @@ export function createUpdateModel(api: TuiPluginApi, options: UpdateModelOptions
       await Promise.resolve();
       drainPending();
       const lastCheck = state.getLastCheck();
-      if (typeof lastCheck === "number" && now() - lastCheck < CHECK_INTERVAL_MS) return;
+      const pluginSpecs = collectPluginSpecs(api);
+      if (
+        typeof lastCheck === "number" &&
+        now() - lastCheck < CHECK_INTERVAL_MS &&
+        sameSpecs(state.getCheckedPluginSpecs(), pluginSpecs)
+      ) return;
       const result = await runCycle();
       const updates = result.candidates.filter((c) => c.updateAvailable === true).length;
       if (updates > 0) {

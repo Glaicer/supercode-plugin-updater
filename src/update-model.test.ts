@@ -701,6 +701,56 @@ test("fresh lastCheck: start skips the cycle — no registry traffic, no toast",
   });
 });
 
+test("fresh lastCheck is bypassed when the configured plugin universe changes", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "server-plugin", "1.0.0");
+    await installPackage(root, "tui-plugin", "1.0.0");
+    const port = spyPort(async () => ({ version: "1.0.0" }));
+    const { fake, build } = makeHarness(port.fetchLatest, root, {
+      specs: ["server-plugin"],
+      now: () => 1_000_000,
+    });
+
+    await build().start();
+    assert.deepEqual([...port.calls], ["server-plugin"]);
+
+    fake.setTuiConfig({ plugin: ["tui-plugin"] });
+    const refreshed = build();
+    await refreshed.start();
+
+    assert.deepEqual([...port.calls], ["server-plugin", "server-plugin", "tui-plugin"]);
+    assert.deepEqual(
+      refreshed.getSnapshot()?.candidates.map((candidate) => candidate.spec),
+      ["server-plugin", "tui-plugin"],
+    );
+  });
+});
+
+test("fresh snapshots from before plugin-universe tracking are refreshed once", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "server-plugin", "1.0.0");
+    await installPackage(root, "tui-plugin", "1.0.0");
+    const port = spyPort(async () => ({ version: "1.0.0" }));
+    const { fake, build } = makeHarness(port.fetchLatest, root, {
+      specs: ["server-plugin"],
+      now: () => 1_000_000,
+    });
+
+    await build().start();
+    fake.kv.delete("plugin-updates.checkedPluginSpecs");
+    fake.setTuiConfig({ plugin: ["tui-plugin"] });
+
+    const upgraded = build();
+    await upgraded.start();
+
+    assert.deepEqual([...port.calls], ["server-plugin", "server-plugin", "tui-plugin"]);
+    assert.deepEqual(
+      upgraded.getSnapshot()?.candidates.map((candidate) => candidate.spec),
+      ["server-plugin", "tui-plugin"],
+    );
+  });
+});
+
 test("stale lastCheck — exactly and well past 24h — re-runs the cycle", async () => {
   await withCacheRoot(async (root) => {
     let now = 1_000_000;

@@ -7,12 +7,15 @@ const UPDATE_STATE_PREFIX = "plugin-updates.";
 const LAST_CHECK_KEY = `${UPDATE_STATE_PREFIX}lastCheck`;
 const AVAILABLE_KEY = `${UPDATE_STATE_PREFIX}available`;
 const PENDING_KEY = `${UPDATE_STATE_PREFIX}pending`;
+const CHECKED_PLUGIN_SPECS_KEY = `${UPDATE_STATE_PREFIX}checkedPluginSpecs`;
 
 export interface UpdateState {
   getLastCheck(): number | undefined;
   setLastCheck(at: number): void;
   getAvailable(): CheckResult | undefined;
   setAvailable(snapshot: CheckResult): void;
+  getCheckedPluginSpecs(): string[] | undefined;
+  setCheckedPluginSpecs(specs: readonly string[]): void;
   getPending(): PendingInvalidationEntry[] | undefined;
   setPending(entries: readonly PendingInvalidationEntry[] | null): void;
 }
@@ -40,6 +43,15 @@ export function createUpdateState(kv: TuiKV): UpdateState {
     getAvailable: () => read<CheckResult>(AVAILABLE_KEY),
     setAvailable: (snapshot) => {
       kv.set(AVAILABLE_KEY, snapshot);
+    },
+    getCheckedPluginSpecs: () => {
+      const value: unknown = kv.get(CHECKED_PLUGIN_SPECS_KEY);
+      return Array.isArray(value) && value.every((spec) => typeof spec === "string")
+        ? value
+        : undefined;
+    },
+    setCheckedPluginSpecs: (specs) => {
+      kv.set(CHECKED_PLUGIN_SPECS_KEY, [...specs]);
     },
     getPending: () => {
       const value: unknown = kv.get(PENDING_KEY);
