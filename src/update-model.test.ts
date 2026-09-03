@@ -1124,6 +1124,31 @@ test("recovery: a new start over the same kv drains pending before the 24h decis
   });
 });
 
+test("after the prepared update is applied, the next start refreshes the stale snapshot without a manual refresh", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { fake, build } = makeHarness(port.fetchLatest, root, { specs: ["foo"] });
+
+    const first = build();
+    await first.start();
+    first.confirm([{ kind: "plugin", spec: "foo" }]);
+    await fake.disposeCallbacks[0]!();
+
+    // The host reinstalls the fresh version into the cache on the next start.
+    await installPackage(root, "foo", "2.0.0");
+
+    const revived = build();
+    await revived.start();
+
+    const snapshot = revived.getSnapshot();
+    assert.ok(snapshot);
+    assert.equal(candidateBySpec(snapshot, "foo").installedVersion, "2.0.0");
+    assert.equal(candidateBySpec(snapshot, "foo").updateAvailable, false);
+    assert.deepEqual([...port.calls], ["foo", "foo"]);
+  });
+});
+
 test("recovery runs before the cycle: the drained package is already gone when the cycle looks", async () => {
   await withCacheRoot(async (root) => {
     await installPackage(root, "foo", "1.0.0");

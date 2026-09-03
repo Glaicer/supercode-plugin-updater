@@ -12,6 +12,7 @@ const CHECKED_PLUGIN_SPECS_KEY = `${UPDATE_STATE_PREFIX}checkedPluginSpecs`;
 export interface UpdateState {
   getLastCheck(): number | undefined;
   setLastCheck(at: number): void;
+  clearLastCheck(): void;
   getAvailable(): CheckResult | undefined;
   setAvailable(snapshot: CheckResult): void;
   getCheckedPluginSpecs(): string[] | undefined;
@@ -39,6 +40,9 @@ export function createUpdateState(kv: TuiKV): UpdateState {
     getLastCheck: () => read<number>(LAST_CHECK_KEY),
     setLastCheck: (at) => {
       kv.set(LAST_CHECK_KEY, at);
+    },
+    clearLastCheck: () => {
+      kv.set(LAST_CHECK_KEY, null);
     },
     getAvailable: () => read<CheckResult>(AVAILABLE_KEY),
     setAvailable: (snapshot) => {

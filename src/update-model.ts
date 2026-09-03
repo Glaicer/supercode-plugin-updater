@@ -1,7 +1,9 @@
 /**
  * Per-package registry failures become unknown candidates. A cycle where
  * every attempted lookup fails is not persisted, allowing the next start to
- * retry rather than waiting for the normal check interval.
+ * retry rather than waiting for the normal check interval. Consuming pending
+ * invalidations erases the last check so the start after an applied update
+ * re-runs the cycle instead of serving the pre-update snapshot.
  */
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
 import {
@@ -295,17 +297,24 @@ export function createUpdateModel(api: TuiPluginApi, options: UpdateModelOptions
     }
   }
 
-  function drainPending(): void {
+  function drainPending(): boolean {
     const entries = state.getPending();
-    if (!entries || entries.length === 0) return;
+    if (!entries || entries.length === 0) return false;
     modelState = "cache-invalidated";
     let remaining = [...entries];
+    let consumed = false;
     for (const entry of entries) {
       if (!consumeEntry(entry)) continue;
+      consumed = true;
       remaining = remaining.filter((candidate) => candidate !== entry);
       state.setPending(remaining.length > 0 ? remaining : null);
     }
     if (remaining.length === 0) modelState = "idle";
+    // Consumed entries change the installed set, so the stored check no longer
+    // describes the cache; erasing lastCheck makes the next start re-run the
+    // cycle instead of serving the pre-update snapshot.
+    if (consumed) state.clearLastCheck();
+    return consumed;
   }
 
   api.lifecycle.onDispose(() => {
