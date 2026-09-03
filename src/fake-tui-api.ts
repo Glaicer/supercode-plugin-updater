@@ -10,6 +10,7 @@ import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
 export interface FakeTuiApi {
   api: TuiPluginApi;
   setConfig(config: Partial<Config>): void;
+  setTuiConfig(config: Partial<TuiPluginApi["tuiConfig"]>): void;
   readonly toasts: { variant: string; title?: string; message: string }[];
   readonly disposeCallbacks: (() => void | Promise<void>)[];
   readonly kv: Map<string, unknown>;
@@ -19,11 +20,15 @@ function fail(what: string): never {
   throw new Error(`fake-tui-api: ${what} is not implemented`);
 }
 
-export function createFakeTuiApi(initialConfig: Partial<Config> = {}): FakeTuiApi {
+export function createFakeTuiApi(
+  initialConfig: Partial<Config> = {},
+  initialTuiConfig: Partial<TuiPluginApi["tuiConfig"]> = {},
+): FakeTuiApi {
   const toasts: { variant: string; title?: string; message: string }[] = [];
   const disposeCallbacks: (() => void | Promise<void>)[] = [];
   const kv = new Map<string, unknown>();
   let config: Partial<Config> = initialConfig;
+  let tuiConfig: Partial<TuiPluginApi["tuiConfig"]> = initialTuiConfig;
 
   const api: TuiPluginApi = {
     app: { version: "0.0.0-test" },
@@ -133,7 +138,9 @@ export function createFakeTuiApi(initialConfig: Partial<Config> = {}): FakeTuiAp
     keymap: {} as TuiPluginApi["keymap"],
     renderer: {} as TuiPluginApi["renderer"],
     client: {} as TuiPluginApi["client"],
-    tuiConfig: {} as TuiPluginApi["tuiConfig"],
+    get tuiConfig() {
+      return tuiConfig as TuiPluginApi["tuiConfig"];
+    },
     slots: {
       register: () => fail("slots.register"),
     },
@@ -150,6 +157,9 @@ export function createFakeTuiApi(initialConfig: Partial<Config> = {}): FakeTuiAp
     api,
     setConfig: (next) => {
       config = next;
+    },
+    setTuiConfig: (next) => {
+      tuiConfig = next;
     },
     toasts,
     disposeCallbacks,

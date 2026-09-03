@@ -84,6 +84,44 @@ export interface UpdateModelOptions {
   now?: () => number;
 }
 
+/**
+ * Plugin entries in both opencode.json (`api.state.config.plugin`) and
+ * tui.json (`api.tuiConfig.plugin`) can be a bare spec string or a
+ * `[spec, options]` tuple. Anything else is ignored defensively.
+ */
+function normalizePluginEntries(entries: unknown): string[] {
+  if (!Array.isArray(entries)) return [];
+  const specs: string[] = [];
+  for (const entry of entries) {
+    if (typeof entry === "string") {
+      specs.push(entry);
+    } else if (Array.isArray(entry) && typeof entry[0] === "string") {
+      specs.push(entry[0]);
+    }
+  }
+  return specs;
+}
+
+/**
+ * Union of opencode.json and tui.json plugin specs, deduplicated by exact
+ * spec string. Server entries come first so a shared spec keeps its
+ * first-seen position.
+ */
+function collectPluginSpecs(api: TuiPluginApi): string[] {
+  const server = normalizePluginEntries(api.state.config.plugin);
+  const tui = normalizePluginEntries(
+    (api.tuiConfig as { plugin?: unknown } | undefined)?.plugin,
+  );
+  const seen = new Set<string>();
+  const merged: string[] = [];
+  for (const spec of [...server, ...tui]) {
+    if (seen.has(spec)) continue;
+    seen.add(spec);
+    merged.push(spec);
+  }
+  return merged;
+}
+
 async function mapPool<Item, Result>(
   items: readonly Item[],
   limit: number,
@@ -130,11 +168,7 @@ export function createUpdateModel(api: TuiPluginApi, options: UpdateModelOptions
   const now = options.now ?? Date.now;
 
   async function runCycle(): Promise<CheckResult> {
-    const entries = api.state.config.plugin;
-    const specs =
-      Array.isArray(entries) ?
-        entries.filter((entry): entry is string => typeof entry === "string")
-      : [];
+    const specs = collectPluginSpecs(api);
 
     const classified = specs.map((spec) => ({ spec, classification: classifyPluginSpec(spec) }));
     const skipped: SkippedSpec[] = [];

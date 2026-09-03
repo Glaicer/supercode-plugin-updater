@@ -82,7 +82,8 @@ function spyPort(handler: (name: string) => Promise<{ version: string }>): SpyPo
 }
 
 interface HarnessOptions {
-  specs?: string[];
+  specs?: unknown[];
+  tuiSpecs?: unknown[];
   now?: () => number;
   timeoutMs?: number;
   concurrency?: number;
@@ -93,7 +94,9 @@ function makeHarness(
   cacheRoot: string,
   options: HarnessOptions = {},
 ): { fake: ReturnType<typeof createFakeTuiApi>; build: () => ReturnType<typeof createUpdateModel> } {
-  const fake = createFakeTuiApi({ plugin: options.specs ?? [] } as Partial<Config>);
+  const fake = createFakeTuiApi({ plugin: (options.specs ?? []) as string[] } as Partial<Config>, {
+    plugin: (options.tuiSpecs ?? []) as never,
+  });
   return {
     fake,
     build: () =>
@@ -108,7 +111,7 @@ function makeHarness(
 }
 
 function makeModel(
-  specs: string[],
+  specs: unknown[],
   port: FetchLatest,
   cacheRoot: string,
   options?: { timeoutMs?: number; concurrency?: number },
@@ -471,6 +474,79 @@ test("non-string config entries are ignored defensively", async () => {
       ["foo"],
     );
     assert.deepEqual(result.skipped, []);
+  });
+});
+
+test("tui.json plugins are checked alongside opencode.json plugins", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    await installPackage(root, "tui-only", "1.0.0");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { build } = makeHarness(port.fetchLatest, root, { specs: ["foo"], tuiSpecs: ["tui-only"] });
+
+    const result = await build().runCheck();
+
+    assert.deepEqual(
+      result.candidates.map((c) => [c.kind, c.spec]),
+      [
+        ["plugin", "foo"],
+        ["plugin", "tui-only"],
+      ],
+    );
+    assert.deepEqual([...port.calls].sort(), ["foo", "tui-only"]);
+  });
+});
+
+test("tui.json tuple entries contribute their spec string; garbage entries are ignored", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { build } = makeHarness(port.fetchLatest, root, {
+      tuiSpecs: [["foo", { label: "demo" }], 42, [42], "./tui-plugins/local.tsx"],
+    });
+
+    const result = await build().runCheck();
+
+    assert.deepEqual(
+      result.candidates.map((c) => c.spec),
+      ["foo"],
+    );
+    assert.deepEqual(result.skipped, [{ kind: "plugin", spec: "./tui-plugins/local.tsx", reason: "local path" }]);
+    assert.deepEqual([...port.calls], ["foo"]);
+  });
+});
+
+test("opencode.json tuple entries contribute their spec string", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { build } = makeHarness(port.fetchLatest, root, {
+      specs: [["foo", { custom: true }]],
+    });
+
+    const result = await build().runCheck();
+
+    assert.deepEqual(
+      result.candidates.map((c) => c.spec),
+      ["foo"],
+    );
+    assert.deepEqual([...port.calls], ["foo"]);
+  });
+});
+
+test("a spec listed in both configs is checked once", async () => {
+  await withCacheRoot(async (root) => {
+    await installPackage(root, "foo", "1.0.0");
+    const port = spyPort(async () => ({ version: "2.0.0" }));
+    const { build } = makeHarness(port.fetchLatest, root, { specs: ["foo"], tuiSpecs: ["foo"] });
+
+    const result = await build().runCheck();
+
+    assert.deepEqual(
+      result.candidates.map((c) => c.spec),
+      ["foo"],
+    );
+    assert.deepEqual([...port.calls], ["foo"]);
   });
 });
 

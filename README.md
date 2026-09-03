@@ -25,7 +25,7 @@ Failures are contained: one unreachable package shows as `unknown` and doesn't b
 
 ## What gets checked
 
-- Floating plugin specs from your effective config, like `foo` and `foo@latest`.
+- Floating plugin specs from `opencode.json` and `tui.json` (union, exact duplicates checked once), like `foo` and `foo@latest`. `[spec, options]` tuple entries contribute their spec string.
 - Managed tools: the bundled tools OpenCode installs for you (prettier, pyright, …).
 
 Skipped, with the reason shown on screen: pinned specs (`foo@1.2.3`), local paths, `file:`/`git+`/URL specs, and semver ranges. Those change only when you change them, so updating them automatically makes no sense.
