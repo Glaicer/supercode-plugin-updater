@@ -1,5 +1,6 @@
-import type { Config } from "@opencode-ai/sdk/v2";
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
+
+type Config = TuiPluginApi["state"]["config"];
 
 /**
  * Typed against the published API so host API drift fails during typecheck.

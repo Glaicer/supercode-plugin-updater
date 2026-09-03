@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Config } from "@opencode-ai/sdk/v2";
+import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
 import { createNpmRegistryPort, type FetchLatest } from "./checker.ts";
 import {
   CHECK_INTERVAL_MS,
@@ -16,6 +16,8 @@ import {
 } from "./update-model.ts";
 import { createFakeTuiApi } from "./fake-tui-api.ts";
 import { MANAGED_TOOLS } from "./tools.ts";
+
+type Config = TuiPluginApi["state"]["config"];
 
 async function withCacheRoot(fn: (root: string) => Promise<void>): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), "plugin-updater-test-"));

@@ -67,6 +67,7 @@ Pinned, unknown, and skipped rows are shown for information but can never be sel
 ## Development
 
 ```bash
+npm run build       # precompile the Solid TUI entrypoint into dist/
 npm run typecheck   # tsc --noEmit
 npm test            # node --test, network-free: registry and cache are fixtures
 ```

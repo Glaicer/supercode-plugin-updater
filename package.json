@@ -19,29 +19,36 @@
     "plugin-updater"
   ],
   "exports": {
-    "./tui": "./src/update-checker.tsx"
+    "./tui": "./dist/update-checker.js"
   },
   "files": [
-    "src",
-    "!src/*.test.ts",
-    "!src/fake-tui-api.ts"
+    "dist"
   ],
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
+    "build": "node scripts/build.mjs",
+    "prepack": "npm run build",
     "test": "node --test 'src/**/*.test.ts'",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@opencode-ai/plugin": ">=1.17.8",
+    "@opencode-ai/plugin": ">=1.17.8"
+  },
+  "peerDependencies": {
     "@opentui/core": ">=0.4.5",
     "@opentui/solid": ">=0.4.5",
     "solid-js": "1.9.12"
   },
   "devDependencies": {
-    "@opencode-ai/sdk": "1.17.8",
+    "@babel/core": "7.28.0",
+    "@babel/preset-typescript": "7.27.1",
+    "@opentui/core": "0.5.10",
+    "@opentui/solid": "0.5.10",
     "@types/node": "24.13.3",
+    "babel-preset-solid": "1.9.12",
+    "solid-js": "1.9.12",
     "typescript": "5.8.2"
   },
   "engines": {
