@@ -229,7 +229,13 @@ function UpdatesScreen(props: {
     if (entries.length > LARGE_DIALOG_MAX_ROWS) props.api.ui.dialog.setSize("large");
   }
 
-  onMount(registerKeys);
+  onMount(() => {
+    registerKeys();
+    // Opening the screen always serves fresh data: bypass the 24h startup
+    // cache with a check now (waits for the startup cycle when still running,
+    // joins a fresh check already in flight).
+    void props.refresh();
+  });
   onCleanup(() => {
     disposed = true;
     pauseKeys();
@@ -252,7 +258,7 @@ function UpdatesScreen(props: {
       </Show>
       <Show when={nothingStored()}>
         <text fg={theme().textMuted}>
-          No update data yet — the check runs once a day on startup and stores its result here.
+          No update data yet — this screen re-checks on every open (plus once a day on startup) and stores its result here.
         </text>
       </Show>
       <box flexDirection="column" flexGrow={1} minHeight={0}>
@@ -293,19 +299,41 @@ const tui: TuiPlugin = async (api) => {
   const [snapshot, setSnapshot] = createSignal<CheckResult | undefined>(model.getSnapshot());
   const [checking, setChecking] = createSignal(false);
 
-  const refresh = async (): Promise<void> => {
+  // Serializes the startup cycle and every refresh so concurrent callers
+  // never fire overlapping registry bursts.
+  let chain: Promise<void> = Promise.resolve();
+  let freshInFlight: Promise<void> | undefined;
+
+  const runFreshCheck = async (): Promise<void> => {
     setChecking(true);
     try {
       await model.runCheck();
     } catch {
+      // Per-package failures already surface as unknown candidates; a total
+      // outage leaves the last snapshot untouched.
     } finally {
       setSnapshot(model.getSnapshot());
       setChecking(false);
     }
   };
 
+  /**
+   * Re-checks now, bypassing the 24h startup TTL. Calls made while the
+   * startup cycle is still running wait for it first; calls made while a
+   * fresh check is already running join it instead of starting another.
+   */
+  const refresh = (): Promise<void> => {
+    if (freshInFlight) return freshInFlight;
+    const done = chain.then(runFreshCheck).finally(() => {
+      if (freshInFlight === done) freshInFlight = undefined;
+    });
+    freshInFlight = done;
+    chain = done.catch(() => {});
+    return done;
+  };
+
   setChecking(true);
-  void model
+  chain = model
     .start()
     .catch(() => {})
     .finally(() => {
