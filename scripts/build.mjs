@@ -1,7 +1,7 @@
 import { transformAsync } from "@babel/core";
 import presetTypeScript from "@babel/preset-typescript";
 import presetSolid from "babel-preset-solid";
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -12,12 +12,7 @@ const outputDir = join(root, "dist");
 await rm(outputDir, { recursive: true, force: true });
 await mkdir(outputDir, { recursive: true });
 
-const files = (await readdir(sourceDir)).filter(
-  (file) =>
-    (file.endsWith(".ts") || file.endsWith(".tsx")) &&
-    !file.endsWith(".test.ts") &&
-    file !== "fake-tui-api.ts",
-);
+const files = ["server-inventory.ts", "update-checker.tsx"];
 
 for (const file of files) {
   const input = join(sourceDir, file);

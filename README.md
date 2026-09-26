@@ -1,5 +1,13 @@
 # plugin-updater
 
+## V2 worktree (ticket 01, not published)
+
+This checkout targets OpenCode 2.0.16. Its compiled `./tui` entrypoint currently provides `/plugin-updates` as a read-only inventory of non-builtin plugins from the connected server. It does not yet check versions, notify, select packages, or update anything. The released `0.3.0` package is still V1; do not use the installation instructions below for this worktree.
+
+For a local V2 test, run `node scripts/build.mjs` and add this directory's **absolute path** to the `plugins` array in global `~/.config/opencode/cli.json`, then start OpenCode 2.0.16. The root `tui.js` loads the compiled `dist/update-checker.js` for directory-based discovery; the package's `./tui` export points directly to the same compiled file. Verify with `npm run typecheck`, `npm test`, and the isolated host probe in `../../.scratch/041-update-checker-v2/probe/RESULTS.md`.
+
+## Published V1 release (0.3.0)
+
 <p>
   <img src="public/plugin-updater.gif" alt="plugin-updater demo" width=800 />
 </p>
