@@ -110,10 +110,13 @@ export interface ServerApply {
 
 /**
  * A row can receive an update right now: the host confirmed one is available
- * and no operation is running for it.
+ * and no operation is running for it. Managed tool rows are informational and
+ * can never receive an update.
  */
 function isUpdatable(row: ServerRow, results: ReadonlyMap<string, ApplyResult>): boolean {
-  return row.status === "update" && results.get(row.id)?.phase !== "updating";
+  return (
+    row.status === "update" && row.runtime !== "tool" && results.get(row.id)?.phase !== "updating"
+  );
 }
 
 interface CliVerdict {

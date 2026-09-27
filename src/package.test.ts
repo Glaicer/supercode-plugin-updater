@@ -9,6 +9,7 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const DIST_FILES = [
   "checker.js",
   "durable-state.js",
+  "managed-tools.js",
   "plugins.js",
   "server-apply.js",
   "server-inventory.js",
@@ -32,11 +33,11 @@ test("the published TUI entrypoint is precompiled with Solid reactivity", async 
   assert.deepEqual((await readdir(join(root, "dist"))).sort(), DIST_FILES);
 });
 
-test("the compiled V2 modules reach no local filesystem or process API beside the TUI adapter", async () => {
+test("the compiled V2 modules reach no local filesystem or process API beside the local-state adapters", async () => {
   for (const file of DIST_FILES) {
     const source = await readFile(join(root, "dist", file), "utf8");
     assert.doesNotMatch(source, /from ["'][^"']+\.tsx?["']/, file);
-    if (file === "tui-packages.js") continue;
+    if (file === "tui-packages.js" || file === "managed-tools.js") continue;
     assert.doesNotMatch(source, /from ["']node:/, file);
   }
 });
@@ -52,4 +53,15 @@ test("the TUI adapter reads local state and runs the standard CLI without mutati
   );
   assert.match(source, /from ["']node:child_process["']/);
   assert.match(source, /\["plugin", "update", target\]/);
+});
+
+test("the managed tools adapter only reads the local cache and never mutates or spawns", async () => {
+  const source = await readFile(join(root, "dist", "managed-tools.js"), "utf8");
+  // The section is read-only: no install, removal, invalidation, or process.
+  assert.doesNotMatch(
+    source,
+    /\b(rmSync|rmdirSync|unlinkSync|writeFileSync|appendFileSync|renameSync|chmodSync|truncateSync|cpSync|mkdtempSync|spawn|exec\()\b/,
+  );
+  assert.match(source, /from ["']node:fs["']/);
+  assert.doesNotMatch(source, /from ["']node:child_process["']/);
 });

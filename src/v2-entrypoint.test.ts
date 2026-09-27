@@ -1,12 +1,16 @@
 import { strict as assert } from "node:assert";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import test, { type TestContext } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Plugin } from "@opencode/plugin/tui";
+import { createManagedToolsPort, createServerLocalityPort } from "./managed-tools.ts";
 import type { ServerApply } from "./server-apply.ts";
 import type { ServerRow, ServerUpdates } from "./server-updates.ts";
 import type { CliUpdateResult, TuiPackagePort } from "./tui-packages.ts";
+import { installGeneration } from "./test-generations.ts";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 registerHooks({
@@ -78,6 +82,7 @@ interface Host {
     list: Array<{ location: unknown; signal?: AbortSignal }>;
     check: Array<{ location: unknown; signal?: AbortSignal }>;
     update: Array<{ location: unknown; targets: string[]; signal?: AbortSignal }>;
+    info: Array<{ signal?: AbortSignal }>;
   };
   cliCalls: CliCall[];
   tui: {
@@ -85,6 +90,7 @@ interface Host {
     versions: Map<string, string>;
     exposed: Map<string, boolean>;
   };
+  cacheDir: string;
   confirms: ConfirmOptions[];
   storageKeys: string[];
   setLocation(directory: string): void;
@@ -93,6 +99,7 @@ interface Host {
   setUpdate(handler: (target: string) => Promise<void>): void;
   setCli(handler: (target: string, cwd: string, signal?: AbortSignal) => CliUpdateResult | Promise<CliUpdateResult>): void;
   setConfirm(handler: (options: ConfirmOptions) => boolean | undefined | Promise<boolean | undefined>): void;
+  setServerInfo(handler: () => Promise<unknown> | unknown): void;
   setup(): Setup;
 }
 
@@ -163,6 +170,10 @@ function rowsBySpec(setup: Setup): Map<string, ServerRow> {
   return new Map(setup.model.rows().map((row) => [row.spec, row]));
 }
 
+function toolRows(setup: Setup): ServerRow[] {
+  return setup.model.rows().filter((row) => row.runtime === "tool");
+}
+
 function createHost(
   t: TestContext,
   options: { location?: string; inventory?: unknown[]; checked?: unknown[]; backing?: Backing } = {},
@@ -172,7 +183,7 @@ function createHost(
   const toasts: Host["toasts"] = [];
   const fetches: Host["fetches"] = [];
   const registry: Host["registry"] = new Map();
-  const requests: Host["requests"] = { list: [], check: [], update: [] };
+  const requests: Host["requests"] = { list: [], check: [], update: [], info: [] };
   const cliCalls: Host["cliCalls"] = [];
   const tui: Host["tui"] = { targets: [], versions: new Map(), exposed: new Map() };
   const storageKeys: string[] = [];
@@ -184,11 +195,53 @@ function createHost(
     async () => ({ code: 0, stdout: "", stderr: "" });
   let confirmHandler: (options: ConfirmOptions) => boolean | undefined | Promise<boolean | undefined> = async () =>
     false;
+  // The default identity describes this machine, so the real locality port
+  // verifies it as local and the section reads the host's tmp cache.
+  const tmpBase = mkdtempSync(join(tmpdir(), "update-checker-"));
+  const tmpRoot = join(tmpBase, "tmp-root");
+  const cacheDir = join(tmpBase, "cache", "opencode");
+  mkdirSync(tmpRoot, { recursive: true });
+  mkdirSync(cacheDir, { recursive: true });
+  t.after(() => rmSync(tmpBase, { recursive: true, force: true }));
+  let infoHandler: () => Promise<unknown> | unknown = async () => ({
+    version: "2.0.16",
+    pid: process.pid,
+    urls: ["http://127.0.0.1:4099"],
+    paths: { tmp: tmpRoot },
+  });
 
   const tuiPackages: TuiPackagePort = {
     cliTargets: () => [...tui.targets],
     installedVersion: (target) => tui.versions.get(target),
     exposesTui: (target) => tui.exposed.get(target) ?? tui.versions.has(target),
+  };
+
+  const client = {
+    plugin: {
+      list: (input: { location?: unknown }, requestOptions?: { signal?: AbortSignal }) => {
+        requests.list.push({ location: input?.location, signal: requestOptions?.signal });
+        return listHandler();
+      },
+      check: (input: { location?: unknown }, requestOptions?: { signal?: AbortSignal }) => {
+        requests.check.push({ location: input?.location, signal: requestOptions?.signal });
+        return checkHandler();
+      },
+      update: (input: { location?: unknown; targets: string[] }, requestOptions?: { signal?: AbortSignal }) => {
+        requests.update.push({
+          location: input?.location,
+          targets: [...(input?.targets ?? [])],
+          signal: requestOptions?.signal,
+        });
+        const [target] = input?.targets ?? [];
+        return updateHandler(target ?? "");
+      },
+    },
+    server: {
+      info: (requestOptions?: { signal?: AbortSignal }) => {
+        requests.info.push({ signal: requestOptions?.signal });
+        return infoHandler();
+      },
+    },
   };
 
   const originalFetch = globalThis.fetch;
@@ -235,6 +288,10 @@ function createHost(
           cliCalls.push({ target, cwd, signal });
           return cliHandler(target, cwd, signal);
         },
+        managedTools: createManagedToolsPort({ cacheDir }),
+        serverLocality: createServerLocalityPort(client as unknown as Plugin.Context["client"], {
+          tmpRoot: () => tmpRoot,
+        }),
       },
       location: {
         get directory() {
@@ -248,27 +305,7 @@ function createHost(
           },
         },
       },
-      client: {
-        plugin: {
-          list: (input: { location?: unknown }, requestOptions?: { signal?: AbortSignal }) => {
-            requests.list.push({ location: input?.location, signal: requestOptions?.signal });
-            return listHandler();
-          },
-          check: (input: { location?: unknown }, requestOptions?: { signal?: AbortSignal }) => {
-            requests.check.push({ location: input?.location, signal: requestOptions?.signal });
-            return checkHandler();
-          },
-          update: (input: { location?: unknown; targets: string[] }, requestOptions?: { signal?: AbortSignal }) => {
-            requests.update.push({
-              location: input?.location,
-              targets: [...(input?.targets ?? [])],
-              signal: requestOptions?.signal,
-            });
-            const [target] = input?.targets ?? [];
-            return updateHandler(target ?? "");
-          },
-        },
-      },
+      client: client as unknown as Plugin.Context["client"],
       storage,
       ui: {
         dialog: {
@@ -337,6 +374,7 @@ function createHost(
     requests,
     cliCalls,
     tui,
+    cacheDir,
     confirms,
     storageKeys,
     setLocation: (directory) => {
@@ -356,6 +394,9 @@ function createHost(
     },
     setConfirm: (handler) => {
       confirmHandler = handler;
+    },
+    setServerInfo: (handler) => {
+      infoHandler = handler;
     },
     setup,
   };
@@ -1613,4 +1654,176 @@ test("cleanup aborts a running CLI operation and sends nothing further", async (
   assert.equal(signal?.aborted, true);
   await flush();
   assert.deepEqual(host.cliCalls.map((call) => call.target), ["tui-only"]); // no retry, no second call
+});
+
+test("installed formatters render as info-only rows, join the count and toast, and never enter the selection", async (t) => {
+  const host = createHost(t, { inventory: [] });
+  const manifest = installGeneration(host.cacheDir, "prettier", "1", "3.0.0");
+  installGeneration(host.cacheDir, "prettier", "2", "3.1.0");
+  installGeneration(host.cacheDir, "@biomejs/biome", "7", "2.0.0");
+  host.registry.set("prettier", () => ({ version: "3.2.0" }));
+  host.registry.set("@biomejs/biome", () => ({ version: "2.0.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+
+  assert.deepEqual(
+    setup.model.rows().map((row) => [row.id, row.runtime, row.spec, row.installedVersion, row.latestVersion, row.status]),
+    [
+      ["tool:prettier", "tool", "prettier", "3.1.0", "3.2.0", "update"],
+      ["tool:@biomejs/biome", "tool", "@biomejs/biome", "2.0.0", "2.0.0", "current"],
+    ],
+  );
+  assert.equal(setup.model.updateCount(), 1); // the formatter update joins the shared count
+  assert.deepEqual(host.toasts, [{ message: "1 OpenCode updates available. Run /plugin-updates to review them." }]);
+  assert.deepEqual(host.fetches.map((fetch) => fetch.name), ["prettier", "@biomejs/biome"]);
+  assert.equal(host.requests.info.length, 1); // the locality verdict was verified once
+  assert.equal(host.requests.check.length, 0); // no plugin targets: no host check
+  assert.deepEqual(setup.model.toolsAvailability(), { available: true });
+
+  // Space and A never mark a managed tool, so U opens no confirmation.
+  commandByBind(setup, "a").run();
+  assert.equal(setup.apply.selected().size, 0);
+  commandByBind(setup, "space").run();
+  assert.equal(setup.apply.selected().size, 0);
+  commandByBind(setup, "down").run();
+  commandByBind(setup, "space").run();
+  assert.equal(setup.apply.selected().size, 0);
+  await commandByBind(setup, "u").run();
+  assert.deepEqual(host.confirms, []);
+  assert.deepEqual(host.requests.update, []);
+
+  // The read-only adapter left the cache bytes untouched through cleanup.
+  const before = readFileSync(manifest, "utf8");
+  setup.cleanup();
+  await flush();
+  assert.equal(readFileSync(manifest, "utf8"), before);
+});
+
+test("a formatter with an unreadable manifest or a failed registry lookup stays unknown without breaking the cycle", async (t) => {
+  const host = createHost(t, { inventory: [] });
+  installGeneration(host.cacheDir, "oxfmt", "1", null);
+  installGeneration(host.cacheDir, "@biomejs/biome", "1", "1.0.0");
+  host.registry.set("oxfmt", () => ({ version: "1.1.0" }));
+  host.registry.set("@biomejs/biome", () => {
+    throw Error("registry offline");
+  });
+
+  const setup = host.setup();
+  await setup.model.start();
+
+  const rows = rowsBySpec(setup);
+  assert.equal(rows.get("oxfmt")?.status, "unknown");
+  assert.equal(rows.get("oxfmt")?.installedVersion, undefined);
+  assert.equal(rows.get("oxfmt")?.reason, "installed version unavailable");
+  assert.equal(rows.get("@biomejs/biome")?.status, "unknown");
+  assert.equal(rows.get("@biomejs/biome")?.reason, "registry lookup failed");
+  assert.equal(setup.model.freshness(), "fresh"); // one isolated failure does not discard the cycle
+  assert.deepEqual(host.toasts, []);
+});
+
+test("a missing cache leaves an empty managed tools section", async (t) => {
+  const host = createHost(t, { inventory: [] });
+  const setup = host.setup();
+  await setup.model.start();
+
+  assert.deepEqual(toolRows(setup), []);
+  assert.deepEqual(setup.model.toolsAvailability(), { available: true });
+  assert.deepEqual(host.fetches, []); // no formatter, no registry request
+});
+
+test("foreign packages and the V1 cache layout contribute no managed tool rows", async (t) => {
+  const host = createHost(t, { inventory: [] });
+  installGeneration(host.cacheDir, "pyright", "1", "1.0.0"); // a managed LSP server, not a formatter
+  const v1Tool = join(host.cacheDir, "packages", "prettier", "node_modules", "prettier");
+  mkdirSync(v1Tool, { recursive: true });
+  writeFileSync(join(v1Tool, "package.json"), JSON.stringify({ name: "prettier", version: "1.0.0" }));
+  const v1Plugin = join(host.cacheDir, "packages", "prettier@latest", "3", "node_modules", "prettier");
+  mkdirSync(v1Plugin, { recursive: true });
+  writeFileSync(join(v1Plugin, "package.json"), JSON.stringify({ name: "prettier", version: "2.0.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+
+  assert.deepEqual(toolRows(setup), []);
+  assert.deepEqual(setup.model.toolsAvailability(), { available: true });
+  assert.deepEqual(host.fetches, []);
+});
+
+test("a server that is not verifiably local keeps the managed tools section unavailable and reads no local cache", async (t) => {
+  const host = createHost(t, { inventory: [] });
+  installGeneration(host.cacheDir, "prettier", "1", "3.0.0");
+  host.registry.set("prettier", () => ({ version: "3.1.0" }));
+
+  host.setServerInfo(() => ({ version: "2.0.16", pid: process.pid, urls: [], paths: { tmp: "/remote/tmp/opencode" } }));
+  const setup = host.setup();
+  await setup.model.start();
+
+  assert.deepEqual(toolRows(setup), []); // the local cache is not read for a remote server
+  assert.deepEqual(setup.model.toolsAvailability(), {
+    available: false,
+    reason: "the connected server is not on this machine",
+  });
+  assert.deepEqual(host.fetches, []); // not even a registry lookup happened
+
+  // An identity that cannot be read is unavailable as well, never local.
+  host.setServerInfo(() => {
+    throw Error("offline");
+  });
+  const second = host.setup();
+  await second.model.start();
+  assert.deepEqual(second.model.toolsAvailability(), {
+    available: false,
+    reason: "the server did not report its identity",
+  });
+  assert.deepEqual(toolRows(second), []);
+});
+
+test("a managed tools snapshot survives a restart without repeating the cycle", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: START });
+  const host = createHost(t, { inventory: [] });
+  installGeneration(host.cacheDir, "prettier", "1", "3.0.0");
+  host.registry.set("prettier", () => ({ version: "3.1.0" }));
+
+  const first = host.setup();
+  await first.model.start();
+  assert.equal(host.fetches.length, 1);
+  assert.equal(host.toasts.length, 1);
+
+  t.mock.timers.setTime(START + HOUR);
+  const second = host.setup();
+  await second.model.start();
+  assert.equal(host.fetches.length, 1); // the fresh TTL served the stored snapshot
+  assert.equal(host.toasts.length, 1);
+  assert.equal(rowsBySpec(second).get("prettier")?.status, "update");
+  assert.deepEqual(second.model.toolsAvailability(), { available: true });
+});
+
+test("a newly installed formatter or a locality flip is never hidden behind a fresh TTL", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: START });
+  const host = createHost(t, { inventory: [] });
+
+  const first = host.setup();
+  await first.model.start();
+  assert.deepEqual(first.model.toolsAvailability(), { available: true });
+  assert.deepEqual(host.fetches, []);
+
+  t.mock.timers.setTime(START + HOUR);
+  installGeneration(host.cacheDir, "prettier", "1", "3.0.0");
+  host.registry.set("prettier", () => ({ version: "3.1.0" }));
+  const second = host.setup();
+  await second.model.start();
+  assert.equal(host.fetches.length, 1); // the fresh snapshot did not hide the new formatter
+  assert.equal(rowsBySpec(second).get("prettier")?.status, "update");
+
+  t.mock.timers.setTime(START + 2 * HOUR);
+  host.setServerInfo(() => ({ version: "2.0.16", pid: process.pid, urls: [], paths: { tmp: "/remote/tmp/opencode" } }));
+  const third = host.setup();
+  await third.model.start();
+  assert.equal(host.fetches.length, 1); // the local cache is not read for the remote connection
+  assert.deepEqual(third.model.toolsAvailability(), {
+    available: false,
+    reason: "the connected server is not on this machine",
+  });
+  assert.deepEqual(toolRows(third), []);
 });

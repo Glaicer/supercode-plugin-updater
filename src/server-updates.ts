@@ -7,6 +7,7 @@ import {
   type FetchLatest,
 } from "./checker.ts";
 import type { DurableState } from "./durable-state.ts";
+import type { LocalityPort, ManagedTool, ManagedToolsPort } from "./managed-tools.ts";
 import { classifyPluginSpec } from "./plugins.ts";
 import type { InventoryPlugin, InventoryPort } from "./server-inventory.ts";
 import type { TuiPackagePort } from "./tui-packages.ts";
@@ -19,11 +20,13 @@ export const STORAGE_KEY = "plugin-updates.v2";
 export const STORAGE_VERSION = 2;
 
 export type Runtime = "server" | "tui";
+/** Managed tool rows come from the local cache; they never receive updates. */
+export type RowRuntime = Runtime | "tool";
 export type ServerRowStatus = "update" | "current" | "unknown" | "pinned" | "skipped";
 
 export interface ServerRow {
   id: string;
-  runtime: Runtime;
+  runtime: RowRuntime;
   spec: string;
   name: string;
   status: ServerRowStatus;
@@ -37,6 +40,12 @@ export interface ServerRow {
   twin?: string;
 }
 
+/** Whether the managed tools section is available on the current connection. */
+export interface ToolsAvailability {
+  available: boolean;
+  reason?: string;
+}
+
 export interface StoredServerState {
   version: number;
   /** Connected-server/location identity the snapshot was checked for. */
@@ -45,6 +54,7 @@ export interface StoredServerState {
   checkedAt: number;
   inventoryKey: string;
   rows: ServerRow[];
+  tools?: ToolsAvailability;
 }
 
 export const EMPTY_SERVER_STATE: StoredServerState = {
@@ -64,12 +74,20 @@ export function tuiRowId(target: string): string {
   return `tui:${target}`;
 }
 
+export function toolRowId(name: string): string {
+  return `tool:${name}`;
+}
+
 export type Freshness = "fresh" | "stale";
 
 export interface ServerUpdatesOptions {
   readonly inventory: InventoryPort;
   /** Effective local TUI package inventory (cli.json targets + installed generations). */
   readonly tui: TuiPackagePort;
+  /** Installed managed tools of this machine's V2 cache. */
+  readonly tools: ManagedToolsPort;
+  /** Whether the connected server provably runs on this machine. */
+  readonly locality: LocalityPort;
   readonly state: DurableState<StoredServerState>;
   readonly environment: () => string;
   readonly fetchLatest: FetchLatest;
@@ -92,6 +110,8 @@ export interface ServerUpdates {
    * compares it with the live connection before sending anything.
    */
   checkedEnvironment(): string;
+  /** The managed-tools section state of the last cycle, or undefined before one ran. */
+  toolsAvailability(): ToolsAvailability | undefined;
   /** Automatic cycle: honours the 24h TTL and may toast. */
   start(): Promise<boolean>;
   /** Manual cycle: ignores the TTL and never toasts. */
@@ -121,7 +141,11 @@ interface Composed {
   updates: number;
 }
 
-function inventoryKey(entries: readonly InventoryPlugin[], tuiTargets: readonly string[]): string {
+function inventoryKey(
+  entries: readonly InventoryPlugin[],
+  tuiTargets: readonly string[],
+  tools: readonly ManagedTool[] | undefined,
+): string {
   const identities = entries.flatMap((entry) => {
     switch (entry.source.type) {
       case "package":
@@ -134,7 +158,11 @@ function inventoryKey(entries: readonly InventoryPlugin[], tuiTargets: readonly 
         return [];
     }
   });
-  return [...new Set([...identities, ...tuiTargets.map((target) => `tui:${target}`)])].sort().join("\n");
+  // undefined marks a non-local server; an empty list is a local cache with
+  // no formatter installed. The two must never share a key.
+  const toolsKey =
+    tools === undefined ? "tools:unavailable" : `tools:${tools.map((tool) => tool.name).sort().join(",")}`;
+  return [...new Set([...identities, ...tuiTargets.map((target) => `tui:${target}`), toolsKey])].sort().join("\n");
 }
 
 function serverRowFor(entry: InventoryPlugin): ServerRow | undefined {
@@ -261,6 +289,7 @@ export function effectiveTuiTargets(entries: readonly InventoryPlugin[], tui: Tu
 async function composeRows(
   entries: readonly InventoryPlugin[],
   tui: TuiPackagePort,
+  tools: readonly ManagedTool[],
   options: {
     fetchLatest: FetchLatest;
     timeoutMs: number;
@@ -311,6 +340,20 @@ async function composeRows(
     if (composed === undefined) continue;
     tuiRows.push(composed.row);
     if (composed.checkable !== undefined) checkable.push(composed.checkable);
+  }
+
+  const toolRows: ServerRow[] = [];
+  for (const tool of tools) {
+    const row: ServerRow = {
+      id: toolRowId(tool.name),
+      runtime: "tool",
+      spec: tool.name,
+      name: tool.name,
+      status: "unknown",
+      ...(tool.version === undefined ? {} : { installedVersion: tool.version }),
+    };
+    toolRows.push(row);
+    checkable.push({ row, name: tool.name });
   }
 
   const names = [...new Set(checkable.map((item) => item.name))];
@@ -365,9 +408,9 @@ async function composeRows(
       continue;
     }
     if (comparison === true) {
-      // A cli.json-only TUI row has no host check; its own registry
-      // comparison against the installed generation is the evidence.
-      if (item.row.runtime === "tui") {
+      // A cli.json-only TUI row and a managed tool have no host check; the
+      // registry comparison against the installed version is the evidence.
+      if (item.row.runtime !== "server") {
         item.row.status = "update";
       } else {
         item.row.status = "unknown";
@@ -385,6 +428,7 @@ async function composeRows(
   }
 
   rows.push(...tuiRows);
+  rows.push(...toolRows);
   for (const target of targets) {
     const serverRow = serverByTarget.get(target)?.row;
     const tuiRow = tuiRows.find((row) => row.spec === target);
@@ -417,6 +461,7 @@ export function createServerUpdates(options: ServerUpdatesOptions): ServerUpdate
   const [freshness, setFreshness] = createSignal<Freshness>("stale");
   const [error, setError] = createSignal("");
   const [checkFailed, setCheckFailed] = createSignal(false);
+  const [toolsAvailability, setToolsAvailability] = createSignal<ToolsAvailability | undefined>(undefined);
 
   const controller = new AbortController();
   let disposed = false;
@@ -432,6 +477,7 @@ export function createServerUpdates(options: ServerUpdatesOptions): ServerUpdate
       const storedHere = stored.version === STORAGE_VERSION && stored.environment === environment;
       if (storedHere && stored.rows.length > 0) {
         setRows(stored.rows);
+        setToolsAvailability(stored.tools);
         lastEnvironment = environment;
       }
 
@@ -447,7 +493,19 @@ export function createServerUpdates(options: ServerUpdatesOptions): ServerUpdate
       if (disposed) return false;
       setError("");
 
-      const key = inventoryKey(entries, effectiveTuiTargets(entries, options.tui));
+      // The managed tools section describes this machine's cache, so its
+      // availability is re-verified every cycle and its verdict keys the
+      // snapshot: a locality or installed-set change must never hide behind
+      // a fresh TTL.
+      const verdict = await options.locality.verify(controller.signal);
+      if (disposed) return false;
+      const availability: ToolsAvailability = verdict.local
+        ? { available: true }
+        : { available: false, reason: verdict.reason };
+      const tools = verdict.local ? options.tools.installed() : undefined;
+      setToolsAvailability(availability);
+
+      const key = inventoryKey(entries, effectiveTuiTargets(entries, options.tui), tools);
       const fresh =
         !manual &&
         storedHere &&
@@ -456,6 +514,8 @@ export function createServerUpdates(options: ServerUpdatesOptions): ServerUpdate
         stored.inventoryKey === key;
       if (fresh) {
         setRows(stored.rows);
+        // The live locality verdict already keyed this snapshot; it describes
+        // the current connection, so it stays instead of the stored reason.
         lastEnvironment = environment;
         setFreshness("fresh");
         setCheckFailed(false);
@@ -473,7 +533,7 @@ export function createServerUpdates(options: ServerUpdatesOptions): ServerUpdate
         if (disposed) return false;
       }
 
-      const composed = await composeRows(checked ?? entries, options.tui, {
+      const composed = await composeRows(checked ?? entries, options.tui, tools ?? [], {
         fetchLatest: options.fetchLatest,
         timeoutMs,
         concurrency,
@@ -497,6 +557,7 @@ export function createServerUpdates(options: ServerUpdatesOptions): ServerUpdate
           checkedAt: complete ? now() : 0,
           inventoryKey: key,
           rows: composed.rows,
+          tools: availability,
         });
       } catch {
         // Durable state is best-effort; the in-memory cycle result still renders.
@@ -541,6 +602,7 @@ export function createServerUpdates(options: ServerUpdatesOptions): ServerUpdate
     // A shared Server/TUI pair is one update unit; count targets, not rows.
     updateCount: () => countUpdateTargets(rows()),
     checkedEnvironment: () => lastEnvironment,
+    toolsAvailability,
     start: () => run(false),
     refresh: () => run(true),
     async reread() {

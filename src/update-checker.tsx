@@ -1,8 +1,14 @@
 /** @jsxImportSource @opentui/solid */
 import { Plugin } from "@opencode/plugin/tui";
-import { For, createSignal } from "solid-js";
+import { For, Show, createSignal } from "solid-js";
 import { createNpmRegistryPort } from "./checker.ts";
 import { createDurableState } from "./durable-state.ts";
+import {
+  createManagedToolsPort,
+  createServerLocalityPort,
+  type LocalityPort,
+  type ManagedToolsPort,
+} from "./managed-tools.ts";
 import { connectedLocation, createServerInventoryPort } from "./server-inventory.ts";
 import {
   createServerApply,
@@ -44,13 +50,16 @@ function version(row: ServerRow): string {
 }
 
 function status(row: ServerRow): string {
+  // Managed tools are informational: no key updates them, so every tool row
+  // says so explicitly.
+  const infoOnly = row.runtime === "tool" ? " · info only" : "";
   switch (row.status) {
     case "update":
-      return "update available";
+      return `update available${infoOnly}`;
     case "current":
-      return "current";
+      return `current${infoOnly}`;
     case "unknown":
-      return `unknown: ${row.reason ?? "unverified"}`;
+      return `unknown: ${row.reason ?? "unverified"}${infoOnly}`;
     case "pinned":
       return `pinned at ${row.pinnedVersion ?? "unknown"} · info only`;
     case "skipped":
@@ -160,6 +169,17 @@ function Screen(props: {
   const move = (delta: number) => setCursor(focus() + delta);
   // One membership computation per render, not one per row.
   const sendable = () => new Set(apply.selectedRows(model.rows()).map((row) => row.id));
+  // Managed tools render as their own read-only section after the plugin rows;
+  // the model always composes them last.
+  const pluginRows = () => model.rows().filter((row) => row.runtime !== "tool");
+  const toolRows = () => model.rows().filter((row) => row.runtime === "tool");
+  const toolsNote = (): string | undefined => {
+    const availability = model.toolsAvailability();
+    if (availability === undefined) return undefined;
+    if (!availability.available) return `unavailable: ${availability.reason}`;
+    if (toolRows().length === 0) return "none installed";
+    return undefined;
+  };
 
   const confirmUpdates = async () => {
     if (apply.running()) return;
@@ -200,11 +220,24 @@ function Screen(props: {
     <box flexDirection="column" width="100%" height="100%" paddingLeft={1}>
       <text fg={context.theme.text.base}><b>Plugin Updates</b></text>
       <text fg={context.theme.text.muted}>{statusLine(model)}  ·  R refresh · Esc back</text>
-      <For each={model.rows()}>
+      <For each={pluginRows()}>
         {(row, index) => (
           <text fg={context.theme.text.base}>{rowLine(row, index(), focus(), apply, sendable())}</text>
         )}
       </For>
+      <Show when={model.toolsAvailability() !== undefined}>
+        <text fg={context.theme.text.muted}>Managed tools · info only — installed and updated by OpenCode itself</text>
+        <For each={toolRows()}>
+          {(row, index) => (
+            <text fg={context.theme.text.base}>
+              {rowLine(row, pluginRows().length + index(), focus(), apply, sendable())}
+            </text>
+          )}
+        </For>
+        <Show when={toolsNote() !== undefined}>
+          <text fg={context.theme.text.muted}>{toolsNote()}</text>
+        </Show>
+      </Show>
       <text fg={context.theme.text.muted}>{applyStatus(apply)}</text>
     </box>
   );
@@ -217,12 +250,18 @@ export default Plugin.define({
       registryBaseUrl?: string;
       tuiPackages?: TuiPackagePort;
       runPluginUpdate?: CliUpdateRunner;
+      managedTools?: ManagedToolsPort;
+      serverLocality?: LocalityPort;
     };
     const inventory = createServerInventoryPort(context);
     const tui = options.tuiPackages ?? createTuiPackagePort();
+    const tools = options.managedTools ?? createManagedToolsPort();
+    const locality = options.serverLocality ?? createServerLocalityPort(context.client);
     const model = createServerUpdates({
       inventory,
       tui,
+      tools,
+      locality,
       state: createDurableState(context.storage, STORAGE_KEY, EMPTY_SERVER_STATE),
       environment: () => connectedLocation(context).directory,
       fetchLatest: createNpmRegistryPort(
