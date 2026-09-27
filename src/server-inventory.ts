@@ -16,6 +16,8 @@ export type InventorySource =
 export interface InventoryPlugin {
   id?: string;
   source: InventorySource;
+  /** The server reports which entrypoints a package carries; tui marks a shared runtime. */
+  features?: { tui?: boolean };
   failed?: string;
 }
 
@@ -27,6 +29,11 @@ export interface InventoryPort {
 function toInventoryPlugin(info: RawPluginInfo): InventoryPlugin {
   const source = info.source;
   const failed = info.state.status === "failed" ? info.state.error : undefined;
+  const features = info.features?.tui === true ? { tui: true as const } : undefined;
+  const extra = {
+    ...(features === undefined ? {} : { features }),
+    ...(failed === undefined ? {} : { failed }),
+  };
   switch (source.type) {
     case "package":
       return {
@@ -37,14 +44,14 @@ function toInventoryPlugin(info: RawPluginInfo): InventoryPlugin {
           version: source.version,
           outdated: source.outdated === true,
         },
-        failed,
+        ...extra,
       };
     case "local":
-      return { id: info.id, source: { type: "local", path: source.path }, failed };
+      return { id: info.id, source: { type: "local", path: source.path }, ...extra };
     case "sdk":
-      return { id: info.id, source: { type: "sdk" }, failed };
+      return { id: info.id, source: { type: "sdk" }, ...extra };
     case "builtin":
-      return { source: { type: "builtin" }, failed };
+      return { source: { type: "builtin" }, ...extra };
   }
 }
 

@@ -12,7 +12,7 @@ const outputDir = join(root, "dist");
 await rm(outputDir, { recursive: true, force: true });
 await mkdir(outputDir, { recursive: true });
 
-const files = ["checker.ts", "durable-state.ts", "plugins.ts", "server-apply.ts", "server-inventory.ts", "server-updates.ts", "update-checker.tsx"];
+const files = ["checker.ts", "durable-state.ts", "plugins.ts", "server-apply.ts", "server-inventory.ts", "server-updates.ts", "tui-packages.ts", "update-checker.tsx"];
 
 for (const file of files) {
   const input = join(sourceDir, file);

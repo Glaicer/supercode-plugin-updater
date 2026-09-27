@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import type { Plugin } from "@opencode/plugin/tui";
 import type { ServerApply } from "./server-apply.ts";
 import type { ServerRow, ServerUpdates } from "./server-updates.ts";
+import type { CliUpdateResult, TuiPackagePort } from "./tui-packages.ts";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 registerHooks({
@@ -62,6 +63,12 @@ interface Backing {
   files: Map<string, string>;
 }
 
+interface CliCall {
+  target: string;
+  cwd: string;
+  signal?: AbortSignal;
+}
+
 interface Host {
   backing: Backing;
   toasts: Array<{ message: string }>;
@@ -72,17 +79,27 @@ interface Host {
     check: Array<{ location: unknown; signal?: AbortSignal }>;
     update: Array<{ location: unknown; targets: string[]; signal?: AbortSignal }>;
   };
+  cliCalls: CliCall[];
+  tui: {
+    targets: string[];
+    versions: Map<string, string>;
+    exposed: Map<string, boolean>;
+  };
   confirms: ConfirmOptions[];
   storageKeys: string[];
   setLocation(directory: string): void;
   setList(handler: () => Promise<{ data: unknown[] }>): void;
   setCheck(handler: () => Promise<{ data: unknown[] }>): void;
   setUpdate(handler: (target: string) => Promise<void>): void;
+  setCli(handler: (target: string, cwd: string, signal?: AbortSignal) => CliUpdateResult | Promise<CliUpdateResult>): void;
   setConfirm(handler: (options: ConfirmOptions) => boolean | undefined | Promise<boolean | undefined>): void;
   setup(): Setup;
 }
 
-function packageInfo(target: string, options: { version?: string; outdated?: boolean; failed?: string } = {}) {
+function packageInfo(
+  target: string,
+  options: { version?: string; outdated?: boolean; failed?: string; tui?: boolean } = {},
+) {
   return {
     source: {
       type: "package",
@@ -90,6 +107,7 @@ function packageInfo(target: string, options: { version?: string; outdated?: boo
       ...(options.version === undefined ? {} : { version: options.version }),
       ...(options.outdated ? { outdated: true } : {}),
     },
+    ...(options.tui ? { features: { tui: true } } : {}),
     state: options.failed === undefined ? { status: "active" } : { status: "failed", error: options.failed },
   };
 }
@@ -116,6 +134,23 @@ async function flush(turns = 10): Promise<void> {
   for (let turn = 0; turn < turns; turn++) await Promise.resolve();
 }
 
+/**
+ * Drives a mocked settle poll: the poll sleeps on the mocked clock, so each
+ * tick advances one 500ms step while the flushes let the re-read settle.
+ */
+async function driveClock(t: TestContext, run: () => Promise<unknown>, steps = 40): Promise<void> {
+  const pending = run();
+  for (let step = 0; step < steps; step++) {
+    await flush(20);
+    t.mock.timers.tick(500);
+  }
+  await pending;
+}
+
+function rowById(setup: Setup, id: string): ServerRow | undefined {
+  return setup.model.rows().find((row) => row.id === id);
+}
+
 function commandByBind(setup: Setup, key: string): Command {
   const command = setup.layers
     .flatMap((layer) => layer().commands ?? [])
@@ -138,13 +173,23 @@ function createHost(
   const fetches: Host["fetches"] = [];
   const registry: Host["registry"] = new Map();
   const requests: Host["requests"] = { list: [], check: [], update: [] };
+  const cliCalls: Host["cliCalls"] = [];
+  const tui: Host["tui"] = { targets: [], versions: new Map(), exposed: new Map() };
   const storageKeys: string[] = [];
   const confirms: ConfirmOptions[] = [];
   let listHandler = async () => ({ data: options.inventory ?? [] });
   let checkHandler = async () => ({ data: options.checked ?? options.inventory ?? [] });
   let updateHandler = async (_target: string) => {};
+  let cliHandler: (target: string, cwd: string, signal?: AbortSignal) => CliUpdateResult | Promise<CliUpdateResult> =
+    async () => ({ code: 0, stdout: "", stderr: "" });
   let confirmHandler: (options: ConfirmOptions) => boolean | undefined | Promise<boolean | undefined> = async () =>
     false;
+
+  const tuiPackages: TuiPackagePort = {
+    cliTargets: () => [...tui.targets],
+    installedVersion: (target) => tui.versions.get(target),
+    exposesTui: (target) => tui.exposed.get(target) ?? tui.versions.has(target),
+  };
 
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async (url: unknown, init?: { signal?: AbortSignal }) => {
@@ -184,7 +229,18 @@ function createHost(
     };
 
     const context = {
-      location: { directory: location },
+      options: {
+        tuiPackages,
+        runPluginUpdate: async (target: string, cwd: string, signal?: AbortSignal) => {
+          cliCalls.push({ target, cwd, signal });
+          return cliHandler(target, cwd, signal);
+        },
+      },
+      location: {
+        get directory() {
+          return location;
+        },
+      },
       data: {
         location: {
           default: () => {
@@ -279,6 +335,8 @@ function createHost(
     fetches,
     registry,
     requests,
+    cliCalls,
+    tui,
     confirms,
     storageKeys,
     setLocation: (directory) => {
@@ -292,6 +350,9 @@ function createHost(
     },
     setUpdate: (handler) => {
       updateHandler = handler;
+    },
+    setCli: (handler) => {
+      cliHandler = handler;
     },
     setConfirm: (handler) => {
       confirmHandler = handler;
@@ -769,8 +830,8 @@ test("U lists the selection with a live-server warning, and cancel sends nothing
 
   assert.equal(host.confirms.length, 1);
   const dialog = host.confirms[0];
-  assert.equal(dialog.title, "Update server plugins");
-  assert.match(dialog.message, /stale/);
+  assert.equal(dialog.title, "Update plugins");
+  assert.match(dialog.message, /server stale/);
   assert.match(dialog.message, /1\.0\.0 → 1\.1\.0/);
   assert.match(dialog.message, /live/);
   assert.deepEqual(dialog.label, { confirm: "Update", cancel: "Cancel" });
@@ -1083,4 +1144,473 @@ test("cleanup aborts an in-flight update and never sends the rest", async (t) =>
     host.backing.files.get("plugin-updates.pending"),
     JSON.stringify([{ kind: "plugin", spec: "v1" }]),
   );
+});
+
+test("TUI rows join the cycle: shared pair, cli-only row, one fetch per name, one toast per target", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: START });
+  const inventory = [packageInfo("shared", { version: "1.0.0", tui: true })];
+  const checked = [packageInfo("shared", { version: "1.0.0", outdated: true, tui: true })];
+  const host = createHost(t, { inventory, checked });
+  host.tui.targets = ["shared", "tui-only"];
+  host.tui.versions.set("shared", "1.0.0");
+  host.tui.versions.set("tui-only", "1.0.0");
+  host.registry.set("shared", () => ({ version: "1.1.0" }));
+  host.registry.set("tui-only", () => ({ version: "1.2.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+
+  assert.deepEqual(
+    setup.model.rows().map((row) => [row.runtime, row.spec, row.status]),
+    [
+      ["server", "shared", "update"],
+      ["tui", "shared", "update"],
+      ["tui", "tui-only", "update"],
+    ],
+  );
+  // The shared pair is one update unit: the toast counts targets, not rows.
+  assert.equal(setup.model.updateCount(), 2);
+  assert.deepEqual(host.toasts, [{ message: "2 OpenCode updates available. Run /plugin-updates to review them." }]);
+  assert.deepEqual(host.fetches.map((fetch) => fetch.name), ["shared", "tui-only"]);
+  const serverRow = rowById(setup, "package:shared");
+  assert.equal(serverRow?.shared, true);
+  assert.equal(serverRow?.twin, "tui:shared");
+  const tuiRow = rowById(setup, "tui:shared");
+  assert.equal(tuiRow?.shared, true);
+  assert.equal(tuiRow?.twin, "package:shared");
+  assert.equal(tuiRow?.installedVersion, "1.0.0");
+
+  // A new cli.json target is never hidden behind a fresh TTL.
+  t.mock.timers.setTime(START + HOUR);
+  host.tui.targets = ["shared", "tui-only", "added"];
+  host.tui.versions.set("added", "1.0.0");
+  host.registry.set("added", () => ({ version: "9.0.0" }));
+  const second = host.setup();
+  await second.model.start();
+  assert.equal(host.requests.check.length, 2); // the cycle repeated despite the fresh clock
+  assert.equal(rowsBySpec(second).get("added")?.status, "update");
+  assert.equal(host.toasts.length, 2); // each cycle with updates toasts once on its own instance
+});
+
+test("the effective TUI inventory omits targets the TUI cannot load", async (t) => {
+  const inventory = [
+    packageInfo("server-only", { version: "1.0.0" }),
+    packageInfo("exposed", { version: "1.0.0", tui: true }),
+  ];
+  const host = createHost(t, { inventory, checked: inventory });
+  host.tui.targets = ["server-only", "exposed", "not-installed", "hidden-entry", "/local/plugin", "pinned@2.0.0"];
+  host.tui.versions.set("server-only", "1.0.0");
+  host.tui.versions.set("exposed", "1.0.0");
+  host.tui.versions.set("hidden-entry", "1.0.0");
+  host.tui.versions.set("pinned@2.0.0", "2.0.0");
+  host.tui.exposed.set("hidden-entry", false);
+  host.registry.set("server-only", () => ({ version: "1.0.0" }));
+  host.registry.set("exposed", () => ({ version: "1.0.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+
+  assert.deepEqual(
+    setup.model.rows().map((row) => [row.runtime, row.spec, row.status]),
+    [
+      ["server", "server-only", "current"],
+      ["server", "exposed", "current"],
+      ["tui", "exposed", "current"],
+      ["tui", "/local/plugin", "skipped"],
+      ["tui", "pinned@2.0.0", "pinned"],
+    ],
+  );
+  const skipped = setup.model.rows().find((row) => row.spec === "/local/plugin");
+  assert.equal(skipped?.reason, "local path");
+  const pinned = setup.model.rows().find((row) => row.spec === "pinned@2.0.0");
+  assert.equal(pinned?.pinnedVersion, "2.0.0");
+  commandByBind(setup, "a").run();
+  assert.equal(setup.apply.selected().size, 0); // skipped and pinned rows never enter the selection
+});
+
+test("a shared twin whose cache is already ahead stays current while the server row updates", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: START });
+  const inventory = [packageInfo("shared", { version: "1.0.0", tui: true })];
+  const checked = [packageInfo("shared", { version: "1.0.0", outdated: true, tui: true })];
+  const host = createHost(t, { inventory, checked });
+  host.tui.targets = ["shared"];
+  host.tui.versions.set("shared", "1.1.0"); // the generation is installed; the server has not re-activated
+  host.registry.set("shared", () => ({ version: "1.1.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+  assert.deepEqual(
+    setup.model.rows().map((row) => [row.runtime, row.spec, row.status]),
+    [
+      ["server", "shared", "update"],
+      ["tui", "shared", "current"],
+    ],
+  );
+
+  // Selecting the updatable row still selects the joint group.
+  commandByBind(setup, "a").run();
+  assert.deepEqual([...setup.apply.selected()].sort(), ["package:shared", "tui:shared"]);
+  host.setConfirm(() => true);
+  let serverApiTouched = false;
+  host.setCli((target) => {
+    assert.equal(target, "shared");
+    return { code: 0, stdout: 'Updated Server plugin "x"\n', stderr: "" };
+  });
+  host.setUpdate(() => {
+    serverApiTouched = true;
+    return Promise.resolve();
+  });
+  const installed = [packageInfo("shared", { version: "1.2.5", tui: true })];
+  host.setList(async () => ({ data: installed }));
+  host.setCheck(async () => ({ data: installed }));
+  await driveClock(t, () => commandByBind(setup, "u").run() as Promise<void>);
+  assert.deepEqual(host.cliCalls.map((call) => call.target), ["shared"]);
+  assert.deepEqual(host.requests.update, []);
+  assert.equal(serverApiTouched, false); // a shared target must not go through the server API
+  // The server runtime moved; the cache-ahead half had nothing left to apply.
+  assert.equal(setup.apply.result("package:shared")?.phase, "updated");
+  const tuiResult = setup.apply.result("tui:shared");
+  assert.equal(tuiResult?.phase, "missing");
+  assert.match(tuiResult?.message ?? "", /did not confirm/);
+});
+
+test("Space selects the whole shared group, the confirmation lists both runtimes, and cancel sends nothing", async (t) => {
+  const inventory = [packageInfo("shared", { version: "1.0.0", tui: true })];
+  const checked = [packageInfo("shared", { version: "1.0.0", outdated: true, tui: true })];
+  const host = createHost(t, { inventory, checked });
+  host.tui.targets = ["shared"];
+  host.tui.versions.set("shared", "1.0.0");
+  host.registry.set("shared", () => ({ version: "1.1.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+  const serverRow = rowById(setup, "package:shared") as ServerRow;
+  setup.apply.toggle(serverRow);
+  assert.deepEqual([...setup.apply.selected()].sort(), ["package:shared", "tui:shared"]);
+
+  await commandByBind(setup, "u").run();
+  assert.equal(host.confirms.length, 1);
+  const dialog = host.confirms[0];
+  assert.match(dialog.message, /· server shared 1\.0\.0 → 1\.1\.0/);
+  assert.match(dialog.message, /· tui shared 1\.0\.0 → 1\.1\.0/);
+  assert.match(dialog.message, /applies these updates live/);
+  assert.match(dialog.message, /until it restarts/);
+  assert.match(dialog.message, /either or both runtimes/);
+  assert.deepEqual(host.cliCalls, []);
+  assert.deepEqual(host.requests.update, []);
+  assert.deepEqual([...setup.apply.selected()].sort(), ["package:shared", "tui:shared"]);
+});
+
+test("a shared target runs one CLI call and both rows re-read their own runtime", async (t) => {
+  const inventory = [packageInfo("shared", { version: "1.0.0", tui: true })];
+  const checked = [packageInfo("shared", { version: "1.0.0", outdated: true, tui: true })];
+  const installed = [packageInfo("shared", { version: "1.2.5", tui: true })];
+  const host = createHost(t, { inventory, checked });
+  host.tui.targets = ["shared"];
+  host.tui.versions.set("shared", "1.0.0");
+  host.registry.set("shared", () => ({ version: "1.1.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+  commandByBind(setup, "a").run();
+
+  let applied = false;
+  host.setList(async () => ({ data: applied ? installed : inventory }));
+  host.setCheck(async () => ({ data: applied ? installed : checked }));
+  host.setCli(() => {
+    applied = true;
+    host.tui.versions.set("shared", "1.2.5");
+    return { code: 0, stdout: 'Updated Server plugin "x"\n', stderr: "" };
+  });
+  host.setConfirm(() => true);
+  await commandByBind(setup, "u").run();
+
+  assert.deepEqual(host.cliCalls.map((call) => call.target), ["shared"]);
+  assert.deepEqual(host.cliCalls.map((call) => call.cwd), ["/connected/project"]);
+  assert.deepEqual(host.requests.update, []); // no second server API update for the same target
+  const serverRow = rowById(setup, "package:shared");
+  assert.equal(serverRow?.installedVersion, "1.2.5");
+  assert.equal(serverRow?.status, "current");
+  const tuiRow = rowById(setup, "tui:shared");
+  assert.equal(tuiRow?.installedVersion, "1.2.5");
+  assert.equal(setup.apply.result("package:shared")?.phase, "updated");
+  assert.equal(setup.apply.result("tui:shared")?.phase, "updated");
+  assert.equal(setup.apply.result("package:shared")?.unchanged, undefined);
+  assert.equal(setup.apply.selected().size, 0);
+});
+
+test("a TUI-only target updates through the CLI alone and leaves the server untouched", async (t) => {
+  const host = createHost(t, { inventory: [] });
+  host.tui.targets = ["tui-only"];
+  host.tui.versions.set("tui-only", "1.0.0");
+  host.registry.set("tui-only", () => ({ version: "1.1.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+  assert.equal(rowsBySpec(setup).get("tui-only")?.status, "update");
+  commandByBind(setup, "a").run();
+
+  host.setCli((target) => {
+    assert.equal(target, "tui-only");
+    host.tui.versions.set("tui-only", "1.1.0");
+    return { code: 0, stdout: 'Updated TUI plugin "tui-only"\n', stderr: "" };
+  });
+  host.setConfirm(() => true);
+  await commandByBind(setup, "u").run();
+
+  assert.deepEqual(host.cliCalls.map((call) => call.target), ["tui-only"]);
+  assert.deepEqual(host.requests.update, []);
+  const row = rowsBySpec(setup).get("tui-only");
+  assert.equal(row?.installedVersion, "1.1.0");
+  assert.equal(row?.status, "current");
+  assert.equal(setup.apply.result("tui:tui-only")?.phase, "updated");
+});
+
+test("a CLI run that updates nothing reports not updated without a re-read", async (t) => {
+  const host = createHost(t, { inventory: [] });
+  host.tui.targets = ["tui-only"];
+  host.tui.versions.set("tui-only", "1.0.0");
+  host.registry.set("tui-only", () => ({ version: "1.1.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+  commandByBind(setup, "a").run();
+
+  const listsAfterCycle = host.requests.list.length;
+  host.setCli(() => ({ code: 0, stdout: "No plugin updates available\n", stderr: "" }));
+  host.setConfirm(() => true);
+  await commandByBind(setup, "u").run();
+
+  assert.deepEqual(host.cliCalls.map((call) => call.target), ["tui-only"]);
+  const result = setup.apply.result("tui:tui-only");
+  assert.equal(result?.phase, "missing");
+  assert.match(result?.message ?? "", /did not confirm/);
+  // Only the pre-send verification read the inventory; nothing was claimed,
+  // so no settle poll ran.
+  assert.equal(host.requests.list.length, listsAfterCycle + 1);
+});
+
+test("a claimed update the inventory does not back is reported as unchanged", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: START });
+  const host = createHost(t, { inventory: [] });
+  host.tui.targets = ["tui-only"];
+  host.tui.versions.set("tui-only", "1.0.0");
+  host.registry.set("tui-only", () => ({ version: "1.1.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+  commandByBind(setup, "a").run();
+
+  host.setCli(() => ({ code: 0, stdout: 'Updated TUI plugin "tui-only"\n', stderr: "" }));
+  host.setConfirm(() => true);
+  await driveClock(t, () => commandByBind(setup, "u").run() as Promise<void>);
+
+  const result = setup.apply.result("tui:tui-only");
+  assert.equal(result?.phase, "updated");
+  assert.equal(result?.unchanged, true); // the installed generation did not move
+  assert.equal(rowsBySpec(setup).get("tui-only")?.installedVersion, "1.0.0");
+});
+
+test("a CLI failure is isolated to its own rows and a repeat press joins the running operation", async (t) => {
+  const inventory = [packageInfo("a-pkg", { version: "1.0.0" })];
+  const checked = [packageInfo("a-pkg", { version: "1.0.0", outdated: true })];
+  const host = createHost(t, { inventory, checked });
+  host.tui.targets = ["tui-only"];
+  host.tui.versions.set("tui-only", "1.0.0");
+  host.registry.set("a-pkg", () => ({ version: "1.1.0" }));
+  host.registry.set("tui-only", () => ({ version: "1.1.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+  commandByBind(setup, "a").run();
+
+  const gate = deferred<void>();
+  host.setCli((_target, _cwd, signal) => {
+    if (signal?.aborted) return { code: 1, stdout: "", stderr: "" };
+    return gate.promise.then(() => ({ code: 1, stdout: "", stderr: 'Failed to update TUI plugin "tui-only": boom\n' }));
+  });
+  host.setUpdate(() => Promise.reject(Error("install failed")));
+  host.setConfirm(() => true);
+  const first = commandByBind(setup, "u").run() as Promise<void>;
+  await flush();
+  assert.equal(host.cliCalls.length, 1);
+
+  // A second press opens no second confirmation and joins the operation.
+  commandByBind(setup, "u").run();
+  const joined = setup.apply.execute(setup.model.rows().filter((row) => row.status === "update"));
+  await flush();
+  assert.equal(host.cliCalls.length, 1);
+  assert.equal(host.requests.update.length, 1);
+
+  gate.resolve();
+  await Promise.all([first, joined]);
+  assert.deepEqual(host.cliCalls.map((call) => call.target), ["tui-only"]);
+  const failed = setup.apply.result("tui:tui-only");
+  assert.equal(failed?.phase, "failed");
+  assert.match(failed?.message ?? "", /boom/);
+  assert.equal(setup.apply.result("package:a-pkg")?.phase, "failed");
+  assert.match(setup.apply.result("package:a-pkg")?.message ?? "", /install failed/);
+});
+
+test("membership changes between selection and send block the group without updating either runtime", async (t) => {
+  // A cli.json-only target that leaves the TUI inventory is blocked.
+  const removed = createHost(t, { inventory: [] });
+  removed.tui.targets = ["tui-only"];
+  removed.tui.versions.set("tui-only", "1.0.0");
+  removed.registry.set("tui-only", () => ({ version: "1.1.0" }));
+  const removedSetup = removed.setup();
+  await removedSetup.model.start();
+  commandByBind(removedSetup, "a").run();
+  removed.setConfirm(() => true);
+  removed.tui.targets = [];
+  await commandByBind(removedSetup, "u").run();
+  assert.deepEqual(removed.cliCalls, []);
+  assert.deepEqual(removed.requests.update, []);
+  assert.equal(removedSetup.apply.result("tui:tui-only")?.phase, "missing");
+  assert.match(removedSetup.apply.result("tui:tui-only")?.message ?? "", /inventory changed/);
+
+  // A shared target whose server row disappears blocks both rows as a group.
+  const shared = createHost(t, {
+    inventory: [packageInfo("shared", { version: "1.0.0", tui: true })],
+    checked: [packageInfo("shared", { version: "1.0.0", outdated: true, tui: true })],
+  });
+  shared.tui.targets = ["shared"];
+  shared.tui.versions.set("shared", "1.0.0");
+  shared.registry.set("shared", () => ({ version: "1.1.0" }));
+  const sharedSetup = shared.setup();
+  await sharedSetup.model.start();
+  commandByBind(sharedSetup, "a").run();
+  shared.setConfirm(() => true);
+  shared.setList(async () => ({ data: [] }));
+  shared.setCheck(async () => ({ data: [] }));
+  await commandByBind(sharedSetup, "u").run();
+  assert.deepEqual(shared.cliCalls, []);
+  assert.deepEqual(shared.requests.update, []);
+  assert.equal(sharedSetup.apply.result("package:shared")?.phase, "missing");
+  assert.equal(sharedSetup.apply.result("tui:shared")?.phase, "missing");
+
+  // A server-only selection that gained a TUI half is blocked the same way.
+  const solo = createHost(t, { inventory: [packageInfo("solo", { version: "1.0.0" })] });
+  solo.setCheck(async () => ({ data: [packageInfo("solo", { version: "1.0.0", outdated: true })] }));
+  solo.registry.set("solo", () => ({ version: "1.1.0" }));
+  const soloSetup = solo.setup();
+  await soloSetup.model.start();
+  commandByBind(soloSetup, "a").run();
+  solo.setConfirm(() => true);
+  solo.tui.targets = ["solo"];
+  solo.tui.versions.set("solo", "1.0.0");
+  await commandByBind(soloSetup, "u").run();
+  assert.deepEqual(solo.cliCalls, []);
+  assert.deepEqual(solo.requests.update, []);
+  assert.equal(soloSetup.apply.result("package:solo")?.phase, "missing");
+});
+
+test("a reload after a completed TUI update neither re-sends nor toasts", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: START });
+  const host = createHost(t, { inventory: [] });
+  host.tui.targets = ["tui-only"];
+  host.tui.versions.set("tui-only", "1.0.0");
+  host.registry.set("tui-only", () => ({ version: "1.1.0" }));
+
+  const first = host.setup();
+  await first.model.start();
+  assert.equal(host.toasts.length, 1);
+  commandByBind(first, "a").run();
+  host.setCli(() => {
+    host.tui.versions.set("tui-only", "1.1.0");
+    return { code: 0, stdout: 'Updated TUI plugin "tui-only"\n', stderr: "" };
+  });
+  host.setConfirm(() => true);
+  await commandByBind(first, "u").run();
+  assert.deepEqual(host.cliCalls.map((call) => call.target), ["tui-only"]);
+
+  // The plugin generation reloads (or the TUI restarts): a fresh setup sees
+  // the updated version, runs no update, and stays silent.
+  t.mock.timers.setTime(START + HOUR);
+  const second = host.setup();
+  await second.model.start();
+  assert.deepEqual(host.cliCalls.map((call) => call.target), ["tui-only"]);
+  assert.deepEqual(host.requests.update, []);
+  assert.equal(host.toasts.length, 1);
+  assert.equal(rowsBySpec(second).get("tui-only")?.status, "current");
+});
+
+test("a send after the connection moved to another location is blocked without updating anything", async (t) => {
+  const host = createHost(t, { inventory: [] });
+  host.tui.targets = ["tui-only"];
+  host.tui.versions.set("tui-only", "1.0.0");
+  host.registry.set("tui-only", () => ({ version: "1.1.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+  assert.equal(setup.model.checkedEnvironment(), "/connected/project");
+  commandByBind(setup, "a").run();
+  host.setConfirm(() => true);
+
+  host.setLocation("/project/other");
+  await commandByBind(setup, "u").run();
+
+  assert.deepEqual(host.cliCalls, []);
+  assert.deepEqual(host.requests.update, []);
+  const result = setup.apply.result("tui:tui-only");
+  assert.equal(result?.phase, "missing");
+  assert.match(result?.message ?? "", /location changed/);
+  // Like every executed send, the attempt consumes the selection; the rows
+  // are stale for the new connection until the next check anyway.
+  assert.equal(setup.apply.selected().size, 0);
+});
+
+test("a claimed update whose fresh row carries no version stays unverified, not unchanged", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: START });
+  const host = createHost(t, { inventory: [] });
+  host.tui.targets = ["tui-only"];
+  host.tui.versions.set("tui-only", "1.0.0");
+  host.registry.set("tui-only", () => ({ version: "1.1.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+  commandByBind(setup, "a").run();
+
+  const unversioned = [{ source: { type: "package", target: "tui-only" }, state: { status: "active" } }];
+  let applied = false;
+  host.setList(async () => ({ data: applied ? unversioned : [] }));
+  host.setCheck(async () => ({ data: applied ? unversioned : [] }));
+  host.setCli(() => {
+    applied = true;
+    return { code: 0, stdout: 'Updated TUI plugin "tui-only"\n', stderr: "" };
+  });
+  host.setConfirm(() => true);
+  await driveClock(t, () => commandByBind(setup, "u").run() as Promise<void>);
+
+  const result = setup.apply.result("tui:tui-only");
+  assert.equal(result?.phase, "updated");
+  assert.equal(result?.unchanged, undefined);
+  assert.equal(result?.unverified, true); // no version was ever observed for the fresh row
+});
+
+test("cleanup aborts a running CLI operation and sends nothing further", async (t) => {
+  const host = createHost(t, { inventory: [] });
+  host.tui.targets = ["tui-only"];
+  host.tui.versions.set("tui-only", "1.0.0");
+  host.registry.set("tui-only", () => ({ version: "1.1.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+  commandByBind(setup, "a").run();
+
+  host.setCli((_target, _cwd, signal) => {
+    return new Promise<CliUpdateResult>((resolve, reject) => {
+      signal?.addEventListener("abort", () => reject(new Error("aborted")));
+    });
+  });
+  host.setConfirm(() => true);
+  const running = commandByBind(setup, "u").run() as Promise<void>;
+  await flush();
+  assert.equal(host.cliCalls.length, 1);
+  const signal = host.cliCalls[0]?.signal;
+
+  setup.cleanup();
+  assert.equal(signal?.aborted, true);
+  await flush();
+  assert.deepEqual(host.cliCalls.map((call) => call.target), ["tui-only"]); // no retry, no second call
 });
