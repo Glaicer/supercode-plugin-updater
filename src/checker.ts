@@ -2,8 +2,49 @@ export interface Latest {
   version: string;
 }
 
+export interface FetchLatestOptions {
+  readonly signal?: AbortSignal;
+}
+
 // Per-package failures reject; the model decides how to isolate them.
-export type FetchLatest = (name: string) => Promise<Latest>;
+export type FetchLatest = (name: string, options?: FetchLatestOptions) => Promise<Latest>;
+
+export async function mapPool<Item, Result>(
+  items: readonly Item[],
+  limit: number,
+  fn: (item: Item) => Promise<Result>,
+): Promise<Result[]> {
+  const results = new Array<Result>(items.length);
+  let next = 0;
+  const workers = Array.from(
+    { length: Math.max(1, Math.min(limit, items.length)) },
+    async () => {
+      while (true) {
+        const index = next++;
+        if (index >= items.length) return;
+        results[index] = await fn(items[index] as Item);
+      }
+    },
+  );
+  await Promise.all(workers);
+  return results;
+}
+
+export function withTimeout<Value>(promise: Promise<Value>, ms: number): Promise<Value> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`registry timeout after ${ms}ms`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
 
 export interface SemverTriple {
   major: number;
@@ -45,8 +86,10 @@ export function createNpmRegistryPort(
 ): FetchLatest {
   const baseUrl = options.baseUrl ?? NPM_REGISTRY_BASE_URL;
   const doFetch = options.fetchImpl ?? fetch;
-  return async (name) => {
-    const response = await doFetch(`${baseUrl}/${encodeURIComponent(name)}/latest`);
+  return async (name, request) => {
+    const response = await doFetch(`${baseUrl}/${encodeURIComponent(name)}/latest`, {
+      signal: request?.signal,
+    });
     if (!response.ok) {
       throw new Error(`registry: ${name}/latest responded ${response.status}`);
     }

@@ -1,9 +1,10 @@
 import { strict as assert } from "node:assert";
 import { registerHooks } from "node:module";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import type { Plugin } from "@opencode/plugin/tui";
+import type { ServerRow, ServerUpdates } from "./server-updates.ts";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 registerHooks({
@@ -15,90 +16,655 @@ registerHooks({
   },
 });
 
-type Model = { status(): string; error(): string; plugins(): unknown[] };
-type Rendered = { props: { model: Model; back(): void } };
+const plugin = (await import(pathToFileURL(join(root, "dist/update-checker.js")).href)).default as {
+  id: string;
+  setup(context: Plugin.Context): void | (() => void);
+};
 
-test("the V2 entrypoint opens server inventory from the connected location and releases its route", async () => {
-  const plugin = (await import(pathToFileURL(join(root, "dist/update-checker.js")).href)).default as {
-    id: string;
-    setup(context: Plugin.Context): void | (() => void);
+const ROUTE = "plugin-updates";
+const START = 1_000_000_000_000;
+const HOUR = 60 * 60 * 1000;
+const DAY = 24 * HOUR;
+
+interface Command {
+  bind?: string;
+  id?: string;
+  title?: string;
+  run(input?: string, event?: unknown): unknown;
+}
+
+interface Layer {
+  commands?: Command[];
+}
+
+interface Setup {
+  model: ServerUpdates;
+  screen: { component: (props: { model: ServerUpdates; back(): void }) => unknown; props: { model: ServerUpdates; back(): void } };
+  cleanup: () => void;
+  layers: Array<() => Layer>;
+  destinations: unknown[];
+  page(): unknown;
+  slot(): unknown;
+}
+
+interface Backing {
+  files: Map<string, string>;
+}
+
+interface Host {
+  backing: Backing;
+  toasts: Array<{ message: string }>;
+  fetches: Array<{ name: string; url: string; signal?: AbortSignal }>;
+  registry: Map<string, () => Promise<unknown> | unknown>;
+  requests: {
+    list: Array<{ location: unknown; signal?: AbortSignal }>;
+    check: Array<{ location: unknown; signal?: AbortSignal }>;
   };
-  assert.equal(plugin.id, "supercode.update-checker");
-  let page: { render(input: object): unknown } | undefined;
-  let removed = false;
-  let slot: { render(): unknown } | undefined;
-  let slotRemoved = false;
-  const previous = { type: "session", sessionID: "ses_test" };
-  const current: Record<string, unknown> = { ...previous };
-  const destinations: unknown[] = [];
-  const layers: Array<() => { commands?: Array<{ id?: string; run(): void }> }> = [];
-  const locations: unknown[] = [];
-  let resolveList!: (value: { data: unknown[] }) => void;
-  let pending = new Promise<{ data: unknown[] }>((resolve) => { resolveList = resolve; });
-  const context = {
-    location: { directory: "/connected/project" },
-    data: { location: { default: () => { throw Error("should use current location"); } } },
-    client: { plugin: { list: ({ location }: { location: unknown }) => {
-      locations.push(location);
-      return pending;
-    } } },
-    ui: { slot: (registered: typeof slot) => { slot = registered; return () => { slotRemoved = true; slot = undefined; }; }, router: {
-      register: (registered: typeof page) => { page = registered; return () => { removed = true; page = undefined; }; },
-      current: () => current,
-      navigate: (destination: unknown) => {
-        destinations.push({ ...(destination as object) });
-        for (const key of Object.keys(current)) delete current[key];
-        Object.assign(current, destination);
-        if (current.type === "plugin" && current.name === "plugin-updates") current.id = "supercode.update-checker";
+  storageKeys: string[];
+  setLocation(directory: string): void;
+  setList(handler: () => Promise<{ data: unknown[] }>): void;
+  setCheck(handler: () => Promise<{ data: unknown[] }>): void;
+  setup(): Setup;
+}
+
+function packageInfo(target: string, options: { version?: string; outdated?: boolean; failed?: string } = {}) {
+  return {
+    source: {
+      type: "package",
+      target,
+      ...(options.version === undefined ? {} : { version: options.version }),
+      ...(options.outdated ? { outdated: true } : {}),
+    },
+    state: options.failed === undefined ? { status: "active" } : { status: "failed", error: options.failed },
+  };
+}
+
+function localInfo(path: string) {
+  return { id: path, source: { type: "local", path }, state: { status: "active" } };
+}
+
+function sdkInfo(id: string) {
+  return { id, source: { type: "sdk" }, state: { status: "active" } };
+}
+
+function deferred<Value>() {
+  let resolve!: (value: Value) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<Value>((settle, fail) => {
+    resolve = settle;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
+async function flush(turns = 10): Promise<void> {
+  for (let turn = 0; turn < turns; turn++) await Promise.resolve();
+}
+
+function commandByBind(setup: Setup, key: string): Command {
+  const command = setup.layers
+    .flatMap((layer) => layer().commands ?? [])
+    .find((candidate) => candidate.bind === key || candidate.id === key);
+  assert.ok(command, `no keymap command bound to ${key}`);
+  return command;
+}
+
+function rowsBySpec(setup: Setup): Map<string, ServerRow> {
+  return new Map(setup.model.rows().map((row) => [row.spec, row]));
+}
+
+function createHost(
+  t: TestContext,
+  options: { location?: string; inventory?: unknown[]; checked?: unknown[]; backing?: Backing } = {},
+): Host {
+  let location = options.location ?? "/connected/project";
+  const backing: Backing = options.backing ?? { files: new Map() };
+  const toasts: Host["toasts"] = [];
+  const fetches: Host["fetches"] = [];
+  const registry: Host["registry"] = new Map();
+  const requests: Host["requests"] = { list: [], check: [] };
+  const storageKeys: string[] = [];
+  let listHandler = async () => ({ data: options.inventory ?? [] });
+  let checkHandler = async () => ({ data: options.checked ?? options.inventory ?? [] });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: unknown, init?: { signal?: AbortSignal }) => {
+    const text = String(url);
+    const name = decodeURIComponent(text.split("/").at(-2) ?? "");
+    fetches.push({ name, url: text, signal: init?.signal });
+    const responder = registry.get(name);
+    if (!responder) return { ok: false, status: 404, json: async () => ({}) } as Response;
+    return { ok: true, status: 200, json: async () => await responder() } as Response;
+  }) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  function setup(): Setup {
+    let page: { render(input: object): unknown } | undefined;
+    let slot: { render(input: object): unknown } | undefined;
+    const layers: Array<() => Layer> = [];
+    const destinations: unknown[] = [];
+    const previous = { type: "session", sessionID: "ses_test" };
+    const current: Record<string, unknown> = { ...previous };
+
+    const storage = {
+      store<Value extends object>(key: string, storeOptions: { initial: Value }) {
+        storageKeys.push(key);
+        const currentValue = backing.files.has(key)
+          ? (JSON.parse(backing.files.get(key) as string) as Value)
+          : structuredClone(storeOptions.initial);
+        return [
+          currentValue,
+          async (mutation: (draft: Value) => void) => {
+            mutation(currentValue);
+            backing.files.set(key, JSON.stringify(currentValue));
+          },
+        ] as const;
       },
-    } },
-    keymap: { layer: (layer: typeof layers[number]) => { layers.push(layer); } },
-  } as unknown as Plugin.Context;
+    };
 
-  const cleanup = plugin.setup(context);
-  assert.equal(locations.length, 0);
-  assert.equal(layers.length, 0);
-  slot?.render();
-  assert.equal(layers[0]?.().commands?.[0]?.id, "supercode.plugin-updates.open");
-  layers[0]?.().commands?.[0]?.run();
-  assert.deepEqual(locations, [{ directory: "/connected/project" }]);
-  assert.deepEqual(destinations, [{ type: "plugin", name: "plugin-updates" }]);
-  const screen = page?.render({}) as Rendered;
-  assert.equal(screen.props.model.status(), "loading");
+    const context = {
+      location: { directory: location },
+      data: {
+        location: {
+          default: () => {
+            throw Error("should use current location");
+          },
+        },
+      },
+      client: {
+        plugin: {
+          list: (input: { location?: unknown }, requestOptions?: { signal?: AbortSignal }) => {
+            requests.list.push({ location: input?.location, signal: requestOptions?.signal });
+            return listHandler();
+          },
+          check: (input: { location?: unknown }, requestOptions?: { signal?: AbortSignal }) => {
+            requests.check.push({ location: input?.location, signal: requestOptions?.signal });
+            return checkHandler();
+          },
+        },
+      },
+      storage,
+      ui: {
+        toast: {
+          show: (toastOptions: { message: string }) => {
+            toasts.push({ message: toastOptions.message });
+          },
+        },
+        slot: (registered: typeof slot) => {
+          slot = registered;
+          return () => {
+            slot = undefined;
+          };
+        },
+        router: {
+          register: (registered: typeof page) => {
+            page = registered;
+            return () => {
+              page = undefined;
+            };
+          },
+          current: () => current,
+          navigate: (destination: unknown) => {
+            destinations.push({ ...(destination as object) });
+            for (const key of Object.keys(current)) delete current[key];
+            Object.assign(current, destination);
+            if (current.type === "plugin" && current.name === ROUTE) current.id = "supercode.update-checker";
+          },
+        },
+      },
+      keymap: {
+        layer: (layer: (typeof layers)[number]) => {
+          layers.push(layer);
+        },
+      },
+      theme: { text: { base: "", muted: "" } },
+    } as unknown as Plugin.Context;
 
-  resolveList({ data: [{ id: "opencode.example", source: { type: "builtin" }, state: { status: "active" } }] });
+    const cleanup = plugin.setup(context) as () => void;
+    slot?.render({});
+    const rendered = page?.render({}) as Setup["screen"];
+    return {
+      model: rendered.props.model,
+      screen: rendered,
+      cleanup,
+      layers,
+      destinations,
+      page: () => page,
+      slot: () => slot,
+    };
+  }
+
+  return {
+    backing,
+    toasts,
+    fetches,
+    registry,
+    requests,
+    storageKeys,
+    setLocation: (directory) => {
+      location = directory;
+    },
+    setList: (handler) => {
+      listHandler = handler;
+    },
+    setCheck: (handler) => {
+      checkHandler = handler;
+    },
+    setup,
+  };
+}
+
+test("the automatic cycle composes installed/latest, toasts once, and the screen opens and returns", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: START });
+  const host = createHost(t, {
+    inventory: [packageInfo("example", { version: "1.0.0" })],
+    checked: [packageInfo("example", { version: "1.0.0", outdated: true })],
+  });
+  host.registry.set("example", () => ({ version: "1.1.0" }));
+
+  const setup = host.setup();
+  assert.equal(host.requests.list.length, 0); // setup never waits for the network
+  await setup.model.start();
+
+  assert.equal(setup.model.checking(), false);
+  assert.equal(setup.model.freshness(), "fresh");
+  assert.equal(setup.model.error(), "");
+  assert.equal(setup.model.updateCount(), 1);
+  const [row] = setup.model.rows();
+  assert.equal(row?.status, "update");
+  assert.equal(row?.spec, "example");
+  assert.equal(row?.installedVersion, "1.0.0");
+  assert.equal(row?.latestVersion, "1.1.0");
+  assert.deepEqual(host.toasts, [{ message: "1 OpenCode updates available. Run /plugin-updates to review them." }]);
+  assert.deepEqual(host.requests.list.map((call) => call.location), [{ directory: "/connected/project" }]);
+  assert.equal(host.requests.check.length, 1);
+
+  commandByBind(setup, "supercode.plugin-updates.open").run();
+  assert.deepEqual(setup.destinations, [{ type: "plugin", name: ROUTE }]);
+  assert.equal(setup.page() === undefined, false);
+
+  setup.screen.component(setup.screen.props);
+  commandByBind(setup, "escape").run();
+  assert.deepEqual(setup.destinations.at(-1), { type: "session", sessionID: "ses_test" });
+});
+
+test("a fresh 24h snapshot for the same inventory is restored on restart without another cycle", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: START });
+  const host = createHost(t, {
+    inventory: [packageInfo("example", { version: "1.0.0" })],
+    checked: [packageInfo("example", { version: "1.0.0", outdated: true })],
+  });
+  host.registry.set("example", () => ({ version: "1.1.0" }));
+
+  const first = host.setup();
+  await first.model.start();
+  assert.equal(host.requests.check.length, 1);
+  assert.equal(host.toasts.length, 1);
+
+  t.mock.timers.setTime(START + HOUR);
+  const second = host.setup();
+  assert.equal(second.model.freshness(), "stale"); // a snapshot is not a verified cycle
+
+  await second.model.start();
+  assert.equal(host.requests.list.length, 2); // the inventory is re-read to compare targets
+  assert.equal(host.requests.check.length, 1); // but the cycle does not repeat
+  assert.equal(host.toasts.length, 1);
+  assert.equal(second.model.freshness(), "fresh");
+  assert.equal(second.model.updateCount(), 1);
+  assert.deepEqual(second.model.rows(), first.model.rows());
+});
+
+test("a new target or another location is never hidden behind a foreign fresh TTL", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: START });
+  const host = createHost(t, {
+    inventory: [packageInfo("a-pkg", { version: "1.0.0" })],
+    checked: [packageInfo("a-pkg", { version: "1.0.0" })],
+  });
+  host.registry.set("a-pkg", () => ({ version: "1.0.0" }));
+
+  const first = host.setup();
+  await first.model.start();
+  assert.equal(host.requests.check.length, 1);
+
+  // A new target in the same inventory.
+  t.mock.timers.setTime(START + HOUR);
+  const changed = [packageInfo("a-pkg", { version: "1.0.0" }), packageInfo("b-pkg", { version: "4.0.0", outdated: true })];
+  host.setList(async () => ({ data: changed }));
+  host.setCheck(async () => ({ data: changed }));
+  host.registry.set("b-pkg", () => ({ version: "5.0.0" }));
+  const second = host.setup();
+  await second.model.start();
+  assert.equal(host.requests.check.length, 2);
+  assert.equal(rowsBySpec(second).get("b-pkg")?.status, "update");
+  assert.equal(host.toasts.length, 1); // the first cycle had no updates; this one toasts once
+
+  // A different environment over the same durable storage.
+  t.mock.timers.setTime(START + 2 * HOUR);
+  host.setLocation("/project/other");
+  host.setList(async () => ({ data: [packageInfo("c-pkg", { version: "1.0.0" })] }));
+  host.setCheck(async () => ({ data: [packageInfo("c-pkg", { version: "1.0.0" })] }));
+  host.registry.set("c-pkg", () => ({ version: "1.0.0" }));
+  const third = host.setup();
+  assert.equal(third.model.rows().length, 0); // no snapshot transfer between locations
+  await third.model.start();
+  assert.equal(host.requests.check.length, 3);
+  assert.deepEqual(third.model.rows().map((row) => row.spec), ["c-pkg"]);
+});
+
+test("only floating specs reach the public registry; pinned is info-only; the rest are skipped with reasons", async (t) => {
+  const inventory = [
+    packageInfo("floating", { version: "1.0.0" }),
+    packageInfo("pinned@2.3.0", { version: "2.3.0" }),
+    packageInfo("ranged@^1.0.0", { version: "1.4.0" }),
+    packageInfo("git+ssh://git@example.com/private/repo.git"),
+    localInfo("/home/me/plugins/local"),
+    sdkInfo("sdk-one"),
+  ];
+  const checked = [
+    packageInfo("floating", { version: "1.0.0", outdated: true }),
+    ...inventory.slice(1),
+  ];
+  const host = createHost(t, { inventory, checked });
+  host.registry.set("floating", () => ({ version: "1.2.0" }));
+  host.registry.set("pinned", () => {
+    throw Error("pinned must not be looked up");
+  });
+
+  const setup = host.setup();
+  await setup.model.start();
+
+  assert.deepEqual(host.fetches.map((fetch) => fetch.name), ["floating"]);
+  const rows = rowsBySpec(setup);
+  assert.equal(rows.get("floating")?.status, "update");
+  assert.equal(rows.get("floating")?.latestVersion, "1.2.0");
+  assert.equal(rows.get("pinned@2.3.0")?.status, "pinned");
+  assert.equal(rows.get("pinned@2.3.0")?.pinnedVersion, "2.3.0");
+  assert.equal(rows.get("ranged@^1.0.0")?.status, "skipped");
+  assert.equal(rows.get("ranged@^1.0.0")?.reason, "semver range");
+  assert.equal(rows.get("git+ssh://git@example.com/private/repo.git")?.status, "skipped");
+  assert.equal(rows.get("git+ssh://git@example.com/private/repo.git")?.reason, "git URL");
+  assert.equal(rows.get("/home/me/plugins/local")?.status, "skipped");
+  assert.equal(rows.get("/home/me/plugins/local")?.reason, "local path");
+  assert.equal(rows.get("sdk-one")?.status, "skipped");
+  assert.equal(rows.get("sdk-one")?.reason, "sdk plugin");
+});
+
+test("registry lookups share one fixed pool of four", async (t) => {
+  const names = ["p1", "p2", "p3", "p4", "p5", "p6"];
+  const host = createHost(t, { inventory: names.map((name) => packageInfo(name, { version: "1.0.0" })) });
+  const gates = names.map(() => deferred<unknown>());
+  let active = 0;
+  let peak = 0;
+  names.forEach((name, index) => {
+    host.registry.set(name, async () => {
+      active++;
+      peak = Math.max(peak, active);
+      try {
+        return await gates[index]?.promise;
+      } finally {
+        active--;
+      }
+    });
+  });
+
+  const setup = host.setup();
+  const pending = setup.model.start();
+  await flush();
+  assert.equal(host.fetches.length, 4); // four workers started, two targets still queued
+  for (const gate of gates) gate.resolve({ version: "1.0.0" });
   await pending;
-  await Promise.resolve();
-  assert.equal(screen.props.model.status(), "empty");
+  assert.equal(host.fetches.length, 6);
+  assert.equal(peak, 4);
+});
 
-  pending = Promise.reject(new Error("server offline"));
-  layers[0]?.().commands?.[0]?.run();
-  await Promise.resolve();
-  assert.equal(screen.props.model.status(), "error");
-  assert.equal(screen.props.model.error(), "server offline");
+test("a registry lookup that outlives the five second budget becomes unknown", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: START });
+  const host = createHost(t, {
+    inventory: [packageInfo("slow", { version: "1.0.0" })],
+    checked: [packageInfo("slow", { version: "1.0.0" })],
+  });
+  host.registry.set("slow", () => new Promise(() => {}));
 
-  pending = new Promise((resolve) => { resolveList = resolve; });
-  layers[0]?.().commands?.[0]?.run();
-  resolveList({ data: [
-    { id: "opencode.example", source: { type: "builtin" }, state: { status: "active" } },
-    { id: "example", source: { type: "package", target: "example@latest" }, state: { status: "active" } },
-  ] });
+  const setup = host.setup();
+  const pending = setup.model.start();
+  await flush();
+  assert.equal(host.fetches.length, 1);
+
+  t.mock.timers.tick(5000);
   await pending;
-  await Promise.resolve();
-  assert.equal(screen.props.model.status(), "ready");
-  assert.equal(screen.props.model.plugins().length, 1);
-  screen.props.back();
-  assert.deepEqual(destinations.at(-1), previous);
+  const [row] = setup.model.rows();
+  assert.equal(row?.status, "unknown");
+  assert.equal(row?.reason, "registry lookup failed");
+  assert.equal(setup.model.freshness(), "stale"); // no evidence from this cycle
+});
 
-  pending = new Promise((resolve) => { resolveList = resolve; });
-  layers[0]?.().commands?.[0]?.run();
-  assert.equal(screen.props.model.status(), "loading");
+test("host outdated and registry metadata stay distinct through failures", async (t) => {
+  const inventory = [
+    packageInfo("confirmed", { version: "1.0.0" }),
+    packageInfo("silent", { version: "1.0.0" }),
+    packageInfo("garbage", { version: "1.0.0" }),
+    packageInfo("same", { version: "1.0.0" }),
+    packageInfo("noversion"),
+  ];
+  const checked = [
+    packageInfo("confirmed", { version: "1.0.0", outdated: true }),
+    ...inventory.slice(1),
+  ];
+  const host = createHost(t, { inventory, checked });
+  host.registry.set("confirmed", () => {
+    throw Error("registry offline");
+  });
+  host.registry.set("silent", () => {
+    throw Error("registry offline");
+  });
+  host.registry.set("garbage", () => ({ version: "not-a-version" }));
+  host.registry.set("same", () => ({ version: "1.0.0" }));
+  host.registry.set("noversion", () => ({ version: "1.0.0" }));
 
-  (cleanup as () => void)();
-  resolveList({ data: [] });
+  const setup = host.setup();
+  await setup.model.start();
+
+  const rows = rowsBySpec(setup);
+  // A host-confirmed update is not hidden by unavailable registry metadata.
+  assert.equal(rows.get("confirmed")?.status, "update");
+  assert.equal(rows.get("confirmed")?.latestVersion, undefined);
+  // Without metadata there is no proof of absence, so the row is unknown, not current.
+  assert.equal(rows.get("silent")?.status, "unknown");
+  assert.equal(rows.get("silent")?.reason, "registry lookup failed");
+  assert.equal(rows.get("garbage")?.status, "unknown");
+  assert.equal(rows.get("garbage")?.reason, "version not parseable");
+  assert.equal(rows.get("noversion")?.status, "unknown");
+  assert.equal(rows.get("noversion")?.reason, "installed version unavailable");
+  // Metadata equality corroborates the host's silence.
+  assert.equal(rows.get("same")?.status, "current");
+});
+
+test("a cycle without evidence keeps the TTL stale and retries after restart", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: START });
+  const inventory = [packageInfo("example", { version: "1.0.0" })];
+  const host = createHost(t, { inventory, checked: inventory });
+  host.registry.set("example", () => {
+    throw Error("registry offline");
+  });
+
+  const first = host.setup();
+  await first.model.start();
+  assert.equal(first.model.freshness(), "stale");
+  assert.equal(host.toasts.length, 0);
+  assert.equal(host.requests.check.length, 1);
+
+  t.mock.timers.setTime(START + HOUR);
+  const second = host.setup();
+  await second.model.start();
+  assert.equal(host.requests.check.length, 2); // the fresh clock did not lock the retry out
+  assert.equal(host.toasts.length, 0);
+});
+
+test("a failed host check is surfaced and never advances the TTL", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: START });
+  const inventory = [packageInfo("example", { version: "1.0.0" })];
+  const host = createHost(t, { inventory });
+  host.setCheck(async () => {
+    throw Error("server offline");
+  });
+  host.registry.set("example", () => ({ version: "1.0.0" }));
+
+  const first = host.setup();
+  await first.model.start();
+  assert.equal(first.model.checkFailed(), true);
+  assert.equal(first.model.error(), "");
+  assert.equal(first.model.freshness(), "stale");
+  assert.equal(rowsBySpec(first).get("example")?.status, "current"); // only the metadata source spoke
+
+  t.mock.timers.setTime(START + HOUR);
+  const second = host.setup();
+  await second.model.start();
+  assert.equal(host.requests.check.length, 2);
+});
+
+test("R ignores a fresh TTL, keeps the snapshot visible, merges concurrent presses, and never toasts", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: START });
+  const host = createHost(t, {
+    inventory: [packageInfo("example", { version: "1.0.0" })],
+    checked: [packageInfo("example", { version: "1.0.0", outdated: true })],
+  });
+  host.registry.set("example", () => ({ version: "1.1.0" }));
+
+  const first = host.setup();
+  await first.model.start();
+  assert.equal(host.toasts.length, 1);
+
+  t.mock.timers.setTime(START + HOUR);
+  const second = host.setup();
+  await second.model.start();
+  assert.equal(host.requests.check.length, 1); // TTL short-circuit
+  second.screen.component(second.screen.props);
+
+  const gate = deferred<{ data: unknown[] }>();
+  host.setCheck(() => gate.promise);
+  const refresh = commandByBind(second, "r");
+  refresh.run();
+  const pending = second.model.refresh();
+  await flush();
+  assert.equal(second.model.checking(), true);
+  assert.equal(second.model.rows().length, 1); // the snapshot stays on screen while checking
+  assert.equal(second.model.rows()[0]?.status, "update");
+  refresh.run(); // a concurrent press joins the same cycle
+  await flush();
+  assert.equal(host.requests.check.length, 2);
+
+  gate.resolve({ data: [packageInfo("example", { version: "1.0.0", outdated: true })] });
   await pending;
-  assert.equal(screen.props.model.status(), "loading");
-  assert.equal(removed, true);
-  assert.equal(slotRemoved, true);
-  assert.equal(page, undefined);
+  assert.equal(second.model.checking(), false);
+  assert.equal(host.toasts.length, 1); // manual cycles never toast
+});
+
+test("an R press during the automatic cycle does not silence its toast", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: START });
+  const gate = deferred<{ data: unknown[] }>();
+  const host = createHost(t, {
+    inventory: [packageInfo("example", { version: "1.0.0" })],
+    checked: [packageInfo("example", { version: "1.0.0", outdated: true })],
+  });
+  host.registry.set("example", () => ({ version: "1.1.0" }));
+  host.setList(() => gate.promise);
+
+  const setup = host.setup();
+  const automatic = setup.model.start();
+  await flush();
+  const manual = setup.model.refresh(); // joins the in-flight automatic cycle
+  gate.resolve({ data: [packageInfo("example", { version: "1.0.0" })] });
+  await manual;
+  await automatic;
+
+  assert.equal(host.toasts.length, 1);
+  assert.equal(rowsBySpec(setup).get("example")?.status, "update");
+});
+
+test("restart over an old TTL runs a fresh cycle and one automatic toast", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: START });
+  const host = createHost(t, {
+    inventory: [packageInfo("example", { version: "1.0.0" })],
+    checked: [packageInfo("example", { version: "1.0.0", outdated: true })],
+  });
+  host.registry.set("example", () => ({ version: "1.1.0" }));
+  const first = host.setup();
+  await first.model.start();
+
+  host.setCheck(async () => ({ data: [packageInfo("example", { version: "1.1.0" })] }));
+  host.registry.set("example", () => ({ version: "1.1.0" }));
+  t.mock.timers.setTime(START + DAY + 1);
+  const second = host.setup();
+  await second.model.start();
+  assert.equal(host.requests.check.length, 2); // the old TTL did not lock the cycle out
+  assert.equal(host.toasts.length, 1); // no updates in the second cycle: silence
+  assert.equal(rowsBySpec(second).get("example")?.status, "current");
+});
+
+test("empty inventory renders empty without a host check and still records the cycle", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: START });
+  const host = createHost(t, { inventory: [] });
+  const setup = host.setup();
+  await setup.model.start();
+  assert.equal(setup.model.rows().length, 0);
+  assert.equal(setup.model.error(), "");
+  assert.equal(host.requests.check.length, 0);
+  assert.equal(host.toasts.length, 0);
+
+  t.mock.timers.setTime(START + HOUR);
+  const second = host.setup();
+  await second.model.start();
+  assert.equal(host.requests.list.length, 2);
+  assert.equal(second.model.freshness(), "fresh");
+  assert.equal(second.model.rows().length, 0);
+});
+
+test("V1 keys in the host store are neither read, executed, nor merged into the V2 snapshot", async (t) => {
+  const host = createHost(t, { inventory: [] });
+  const pending = [{ kind: "plugin", spec: "v1-plugin" }];
+  host.backing.files.set("plugin-updates.pending", JSON.stringify(pending));
+  host.backing.files.set("plugin-updates.lastCheck", JSON.stringify(Date.now()));
+  host.backing.files.set(
+    "plugin-updates.available",
+    JSON.stringify({ candidates: [{ spec: "v1-plugin", status: "checked", updateAvailable: true }], skipped: [] }),
+  );
+
+  const setup = host.setup();
+  await setup.model.start();
+
+  assert.deepEqual(host.storageKeys, ["plugin-updates.v2"]);
+  assert.deepEqual(JSON.parse(host.backing.files.get("plugin-updates.pending") as string), pending);
+  assert.equal(setup.model.rows().length, 0);
+  assert.equal(setup.model.updateCount(), 0);
+  assert.equal(host.toasts.length, 0);
+  assert.equal(host.backing.files.size, 4); // nothing deleted, one new snapshot
+  const stored = JSON.parse(host.backing.files.get("plugin-updates.v2") as string) as { version: number; environment: string };
+  assert.equal(stored.version, 2);
+  assert.equal(stored.environment, "/connected/project");
+});
+
+test("cleanup releases the route and slot and cancels an in-flight cycle without writing storage", async (t) => {
+  const gate = deferred<{ data: unknown[] }>();
+  const host = createHost(t, { inventory: [packageInfo("example", { version: "1.0.0" })] });
+  host.setList(() => gate.promise);
+
+  const setup = host.setup();
+  assert.notEqual(setup.page(), undefined);
+  assert.notEqual(setup.slot(), undefined);
+  await flush();
+  assert.equal(host.requests.list.length, 1);
+  const signal = host.requests.list[0]?.signal;
+
+  setup.cleanup();
+  assert.equal(signal?.aborted, true);
+  assert.equal(setup.page(), undefined);
+  assert.equal(setup.slot(), undefined);
+
+  gate.resolve({ data: [packageInfo("example", { version: "1.0.0" })] });
+  await flush();
+  assert.equal(setup.model.checking(), true); // the disposed model never receives the late result
+  assert.equal(setup.model.rows().length, 0);
+  assert.equal(host.backing.files.size, 0);
 });
