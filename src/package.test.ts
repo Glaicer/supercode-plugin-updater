@@ -26,7 +26,7 @@ test("the published TUI entrypoint is precompiled with Solid reactivity", async 
   const compiled = await readFile(join(root, "dist", "update-checker.js"), "utf8");
 
   assert.equal(packageJson.exports?.["./tui"], "./dist/update-checker.js");
-  assert.deepEqual(packageJson.files, ["dist"]);
+  assert.deepEqual(packageJson.files, ["dist", "tui.js"]);
   assert.match(compiled, /get each\(\)/);
   assert.match(compiled, /_\$effect/);
   assert.doesNotMatch(compiled, /from ["'][^"']+\.tsx?["']/);

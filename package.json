@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "@glaicer/supercode-plugin-updater",
-  "version": "0.3.0",
-  "description": "OpenCode V2 TUI plugin: connected server plugin inventory",
+  "version": "1.0.0",
+  "description": "OpenCode V2 TUI plugin: check and update server plugins and TUI packages, with update info for managed tools",
   "type": "module",
   "license": "MIT",
   "author": "Dmitrii Aronov <aronov.mml@gmail.com>",
@@ -22,7 +22,8 @@
     "./tui": "./dist/update-checker.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "tui.js"
   ],
   "publishConfig": {
     "access": "public"
@@ -40,7 +41,18 @@
   "peerDependencies": {
     "@opentui/core": ">=0.5.10",
     "@opentui/solid": ">=0.5.10",
-    "solid-js": "1.9.12"
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/core": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@babel/core": "7.28.0",
