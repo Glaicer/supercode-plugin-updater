@@ -10,6 +10,7 @@ const DIST_FILES = [
   "checker.js",
   "durable-state.js",
   "plugins.js",
+  "server-apply.js",
   "server-inventory.js",
   "server-updates.js",
   "update-checker.js",

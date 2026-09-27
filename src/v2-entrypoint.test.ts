@@ -4,6 +4,7 @@ import test, { type TestContext } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import type { Plugin } from "@opencode/plugin/tui";
+import type { ServerApply } from "./server-apply.ts";
 import type { ServerRow, ServerUpdates } from "./server-updates.ts";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -37,9 +38,19 @@ interface Layer {
   commands?: Command[];
 }
 
+interface ConfirmOptions {
+  title: string;
+  message: string;
+  label?: { confirm?: string; cancel?: string };
+}
+
 interface Setup {
   model: ServerUpdates;
-  screen: { component: (props: { model: ServerUpdates; back(): void }) => unknown; props: { model: ServerUpdates; back(): void } };
+  apply: ServerApply;
+  screen: {
+    component: (props: { model: ServerUpdates; apply: ServerApply; back(): void }) => unknown;
+    props: { model: ServerUpdates; apply: ServerApply; back(): void };
+  };
   cleanup: () => void;
   layers: Array<() => Layer>;
   destinations: unknown[];
@@ -59,11 +70,15 @@ interface Host {
   requests: {
     list: Array<{ location: unknown; signal?: AbortSignal }>;
     check: Array<{ location: unknown; signal?: AbortSignal }>;
+    update: Array<{ location: unknown; targets: string[]; signal?: AbortSignal }>;
   };
+  confirms: ConfirmOptions[];
   storageKeys: string[];
   setLocation(directory: string): void;
   setList(handler: () => Promise<{ data: unknown[] }>): void;
   setCheck(handler: () => Promise<{ data: unknown[] }>): void;
+  setUpdate(handler: (target: string) => Promise<void>): void;
+  setConfirm(handler: (options: ConfirmOptions) => boolean | undefined | Promise<boolean | undefined>): void;
   setup(): Setup;
 }
 
@@ -122,10 +137,14 @@ function createHost(
   const toasts: Host["toasts"] = [];
   const fetches: Host["fetches"] = [];
   const registry: Host["registry"] = new Map();
-  const requests: Host["requests"] = { list: [], check: [] };
+  const requests: Host["requests"] = { list: [], check: [], update: [] };
   const storageKeys: string[] = [];
+  const confirms: ConfirmOptions[] = [];
   let listHandler = async () => ({ data: options.inventory ?? [] });
   let checkHandler = async () => ({ data: options.checked ?? options.inventory ?? [] });
+  let updateHandler = async (_target: string) => {};
+  let confirmHandler: (options: ConfirmOptions) => boolean | undefined | Promise<boolean | undefined> = async () =>
+    false;
 
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async (url: unknown, init?: { signal?: AbortSignal }) => {
@@ -183,10 +202,25 @@ function createHost(
             requests.check.push({ location: input?.location, signal: requestOptions?.signal });
             return checkHandler();
           },
+          update: (input: { location?: unknown; targets: string[] }, requestOptions?: { signal?: AbortSignal }) => {
+            requests.update.push({
+              location: input?.location,
+              targets: [...(input?.targets ?? [])],
+              signal: requestOptions?.signal,
+            });
+            const [target] = input?.targets ?? [];
+            return updateHandler(target ?? "");
+          },
         },
       },
       storage,
       ui: {
+        dialog: {
+          confirm: (dialogOptions: ConfirmOptions) => {
+            confirms.push(dialogOptions);
+            return Promise.resolve(confirmHandler(dialogOptions));
+          },
+        },
         toast: {
           show: (toastOptions: { message: string }) => {
             toasts.push({ message: toastOptions.message });
@@ -225,8 +259,11 @@ function createHost(
     const cleanup = plugin.setup(context) as () => void;
     slot?.render({});
     const rendered = page?.render({}) as Setup["screen"];
+    // The host mounts the rendered page, which registers the screen's keymap layer.
+    rendered?.component(rendered.props);
     return {
       model: rendered.props.model,
+      apply: rendered.props.apply,
       screen: rendered,
       cleanup,
       layers,
@@ -242,6 +279,7 @@ function createHost(
     fetches,
     registry,
     requests,
+    confirms,
     storageKeys,
     setLocation: (directory) => {
       location = directory;
@@ -251,6 +289,12 @@ function createHost(
     },
     setCheck: (handler) => {
       checkHandler = handler;
+    },
+    setUpdate: (handler) => {
+      updateHandler = handler;
+    },
+    setConfirm: (handler) => {
+      confirmHandler = handler;
     },
     setup,
   };
@@ -667,4 +711,376 @@ test("cleanup releases the route and slot and cancels an in-flight cycle without
   assert.equal(setup.model.checking(), true); // the disposed model never receives the late result
   assert.equal(setup.model.rows().length, 0);
   assert.equal(host.backing.files.size, 0);
+});
+
+test("Space and A select only updatable rows", async (t) => {
+  const inventory = [
+    packageInfo("stale", { version: "1.0.0" }),
+    packageInfo("fresh", { version: "2.0.0" }),
+    packageInfo("pinned@1.0.0", { version: "1.0.0" }),
+    localInfo("/home/me/local"),
+  ];
+  const checked = [packageInfo("stale", { version: "1.0.0", outdated: true }), ...inventory.slice(1)];
+  const host = createHost(t, { inventory, checked });
+  host.registry.set("stale", () => ({ version: "1.1.0" }));
+  host.registry.set("fresh", () => ({ version: "2.0.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+  assert.deepEqual(
+    setup.model.rows().map((row) => row.status),
+    ["update", "current", "pinned", "skipped"],
+  );
+
+  commandByBind(setup, "a").run();
+  assert.deepEqual([...setup.apply.selected()], ["package:stale"]);
+  setup.apply.clearSelection();
+
+  // Space never marks pinned or skipped rows.
+  commandByBind(setup, "down").run();
+  commandByBind(setup, "down").run();
+  commandByBind(setup, "space").run();
+  assert.equal(setup.apply.selected().size, 0);
+  commandByBind(setup, "down").run();
+  commandByBind(setup, "space").run();
+  assert.equal(setup.apply.selected().size, 0);
+
+  // Space toggles the updatable row under the cursor.
+  commandByBind(setup, "up").run();
+  commandByBind(setup, "up").run();
+  commandByBind(setup, "up").run();
+  commandByBind(setup, "space").run();
+  assert.deepEqual([...setup.apply.selected()], ["package:stale"]);
+  commandByBind(setup, "space").run();
+  assert.equal(setup.apply.selected().size, 0);
+});
+
+test("U lists the selection with a live-server warning, and cancel sends nothing", async (t) => {
+  const inventory = [packageInfo("stale", { version: "1.0.0" })];
+  const checked = [packageInfo("stale", { version: "1.0.0", outdated: true })];
+  const host = createHost(t, { inventory, checked });
+  host.registry.set("stale", () => ({ version: "1.1.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+  commandByBind(setup, "a").run();
+
+  await commandByBind(setup, "u").run();
+
+  assert.equal(host.confirms.length, 1);
+  const dialog = host.confirms[0];
+  assert.equal(dialog.title, "Update server plugins");
+  assert.match(dialog.message, /stale/);
+  assert.match(dialog.message, /1\.0\.0 → 1\.1\.0/);
+  assert.match(dialog.message, /live/);
+  assert.deepEqual(dialog.label, { confirm: "Update", cancel: "Cancel" });
+  // The default fake answer is cancel: no update may leave the screen.
+  assert.deepEqual(host.requests.update, []);
+  assert.deepEqual([...setup.apply.selected()], ["package:stale"]);
+});
+
+test("confirming sends each target once and shows the version actually installed", async (t) => {
+  const inventory = [packageInfo("stale", { version: "1.0.0" })];
+  const checked = [packageInfo("stale", { version: "1.0.0", outdated: true })];
+  const installed = [packageInfo("stale", { version: "1.2.5" })];
+  const host = createHost(t, { inventory, checked });
+  host.registry.set("stale", () => ({ version: "1.1.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+  commandByBind(setup, "a").run();
+
+  // The server resolves and installs a newer version than the snapshot promised.
+  let applied = false;
+  host.setList(async () => ({ data: applied ? installed : inventory }));
+  host.setCheck(async () => ({ data: applied ? installed : checked }));
+  host.setUpdate(() => {
+    applied = true;
+    return Promise.resolve();
+  });
+  host.setConfirm(() => true);
+  await commandByBind(setup, "u").run();
+
+  assert.deepEqual(host.requests.update.map((call) => call.targets), [["stale"]]);
+  assert.deepEqual(host.requests.update.map((call) => call.location), [{ directory: "/connected/project" }]);
+  const row = rowsBySpec(setup).get("stale");
+  assert.equal(row?.installedVersion, "1.2.5"); // the actual result, not the promised 1.1.0
+  assert.equal(row?.status, "current");
+  const result = setup.apply.result("package:stale");
+  assert.equal(result?.phase, "updated");
+  assert.equal(result?.unverified, undefined);
+  assert.equal(setup.apply.running(), false);
+  assert.equal(setup.apply.selected().size, 0);
+});
+
+test("a failed target does not stop the others", async (t) => {
+  const inventory = [packageInfo("a-pkg", { version: "1.0.0" }), packageInfo("b-pkg", { version: "1.0.0" })];
+  const checked = [
+    packageInfo("a-pkg", { version: "1.0.0", outdated: true }),
+    packageInfo("b-pkg", { version: "1.0.0", outdated: true }),
+  ];
+  const host = createHost(t, { inventory, checked });
+  host.registry.set("a-pkg", () => ({ version: "1.1.0" }));
+  host.registry.set("b-pkg", () => ({ version: "1.1.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+  commandByBind(setup, "a").run();
+
+  const installed = [packageInfo("a-pkg", { version: "1.0.0" }), packageInfo("b-pkg", { version: "1.1.0" })];
+  let applied = false;
+  host.setList(async () => ({ data: applied ? installed : inventory }));
+  host.setCheck(async () => ({ data: applied ? installed : checked }));
+  host.setUpdate((target) => {
+    if (target === "a-pkg") throw Error("install failed");
+    applied = true;
+    return Promise.resolve();
+  });
+  host.setConfirm(() => true);
+  await commandByBind(setup, "u").run();
+
+  assert.deepEqual(host.requests.update.map((call) => call.targets), [["a-pkg"], ["b-pkg"]]);
+  const failed = setup.apply.result("package:a-pkg");
+  assert.equal(failed?.phase, "failed");
+  assert.match(failed?.message ?? "", /install failed/);
+  assert.equal(setup.apply.result("package:b-pkg")?.phase, "updated");
+});
+
+test("targets that left the inventory are not updated", async (t) => {
+  const inventory = [packageInfo("stale", { version: "1.0.0" })];
+  const checked = [packageInfo("stale", { version: "1.0.0", outdated: true })];
+  const host = createHost(t, { inventory, checked });
+  host.registry.set("stale", () => ({ version: "1.1.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+  commandByBind(setup, "a").run();
+
+  host.setList(async () => ({ data: [] }));
+  host.setConfirm(() => true);
+  await commandByBind(setup, "u").run();
+
+  assert.deepEqual(host.requests.update, []);
+  assert.equal(setup.apply.result("package:stale")?.phase, "missing");
+  // The pre-send verification read the inventory; nothing was applied, so no re-read ran.
+  assert.equal(host.requests.list.length, 2);
+});
+
+test("a repeat U while an operation runs sends nothing twice", async (t) => {
+  const inventory = [packageInfo("stale", { version: "1.0.0" })];
+  const checked = [packageInfo("stale", { version: "1.0.0", outdated: true })];
+  const host = createHost(t, { inventory, checked });
+  host.registry.set("stale", () => ({ version: "1.1.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+  commandByBind(setup, "a").run();
+
+  const gate = deferred<void>();
+  const installed = [packageInfo("stale", { version: "1.1.0" })];
+  let applied = false;
+  host.setList(async () => ({ data: applied ? installed : inventory }));
+  host.setCheck(async () => ({ data: applied ? installed : checked }));
+  host.setUpdate(() => {
+    applied = true;
+    return gate.promise.then(() => undefined);
+  });
+  host.setConfirm(() => true);
+  const first = commandByBind(setup, "u").run() as Promise<void>;
+  await flush();
+  assert.equal(host.requests.update.length, 1);
+  assert.equal(setup.apply.result("package:stale")?.phase, "updating");
+  assert.equal(setup.apply.running(), true);
+
+  // A second press opens no second confirmation while the operation runs.
+  commandByBind(setup, "u").run();
+  await flush();
+  assert.equal(host.confirms.length, 1);
+  // The model itself joins the running operation instead of re-sending.
+  const joined = setup.apply.execute(setup.model.rows().slice(0, 1));
+  await flush();
+  assert.equal(host.requests.update.length, 1);
+
+  gate.resolve();
+  await Promise.all([first, joined]);
+  assert.equal(setup.apply.result("package:stale")?.phase, "updated");
+  assert.deepEqual(host.requests.update.map((call) => call.targets), [["stale"]]);
+});
+
+test("an in-flight row cannot be toggled while its update runs", async (t) => {
+  const inventory = [packageInfo("stale", { version: "1.0.0" })];
+  const checked = [packageInfo("stale", { version: "1.0.0", outdated: true })];
+  const host = createHost(t, { inventory, checked });
+  host.registry.set("stale", () => ({ version: "1.1.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+  commandByBind(setup, "a").run();
+
+  const gate = deferred<void>();
+  const installed = [packageInfo("stale", { version: "1.1.0" })];
+  let applied = false;
+  host.setList(async () => ({ data: applied ? installed : inventory }));
+  host.setCheck(async () => ({ data: applied ? installed : checked }));
+  host.setUpdate(() => {
+    applied = true;
+    return gate.promise.then(() => undefined);
+  });
+  host.setConfirm(() => true);
+  const running = commandByBind(setup, "u").run() as Promise<void>;
+  await flush();
+  const row = setup.model.rows()[0];
+  setup.apply.toggle(row as ServerRow); // would unmark if the row were still selectable
+  assert.deepEqual([...setup.apply.selected()], ["package:stale"]);
+
+  gate.resolve();
+  await running;
+});
+
+test("a successful load with failed activation is not reported as a clean success", async (t) => {
+  const inventory = [packageInfo("stale", { version: "1.0.0" })];
+  const checked = [packageInfo("stale", { version: "1.0.0", outdated: true })];
+  const broken = [
+    { ...packageInfo("stale", { version: "1.2.5" }), state: { status: "failed", error: "activation boom" } },
+  ];
+  const host = createHost(t, { inventory, checked });
+  host.registry.set("stale", () => ({ version: "1.1.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+  commandByBind(setup, "a").run();
+
+  let applied = false;
+  host.setList(async () => ({ data: applied ? broken : inventory }));
+  host.setCheck(async () => ({ data: applied ? broken : checked }));
+  host.setUpdate(() => {
+    applied = true;
+    return Promise.resolve();
+  });
+  host.setConfirm(() => true);
+  await commandByBind(setup, "u").run();
+
+  // The install call itself succeeded; the failed activation stays visible on the row.
+  assert.equal(setup.apply.result("package:stale")?.phase, "updated");
+  const row = rowsBySpec(setup).get("stale");
+  assert.equal(row?.failed, "activation boom");
+});
+
+test("a target that vanishes from the fresh inventory stays unverified", async (t) => {
+  const inventory = [packageInfo("stale", { version: "1.0.0" })];
+  const checked = [packageInfo("stale", { version: "1.0.0", outdated: true })];
+  const host = createHost(t, { inventory, checked });
+  host.registry.set("stale", () => ({ version: "1.1.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+  commandByBind(setup, "a").run();
+
+  let applied = false;
+  host.setList(async () => ({ data: applied ? [] : inventory }));
+  host.setCheck(async () => ({ data: applied ? [] : checked }));
+  host.setUpdate(() => {
+    applied = true;
+    return Promise.resolve();
+  });
+  host.setConfirm(() => true);
+  await commandByBind(setup, "u").run();
+
+  assert.deepEqual(host.requests.update.map((call) => call.targets), [["stale"]]);
+  // The install call succeeded, but no fresh inventory row backs it.
+  assert.equal(setup.apply.result("package:stale")?.unverified, true);
+});
+
+test("a failed re-read leaves an applied update unverified", async (t) => {
+  const inventory = [packageInfo("stale", { version: "1.0.0" })];
+  const checked = [packageInfo("stale", { version: "1.0.0", outdated: true })];
+  const host = createHost(t, { inventory, checked });
+  host.registry.set("stale", () => ({ version: "1.1.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+  commandByBind(setup, "a").run();
+
+  let offline = false;
+  host.setList(async () => {
+    if (offline) throw Error("server offline");
+    return { data: checked };
+  });
+  host.setUpdate(() => {
+    offline = true;
+    return Promise.resolve();
+  });
+  host.setConfirm(() => true);
+  await commandByBind(setup, "u").run();
+
+  assert.deepEqual(host.requests.update.map((call) => call.targets), [["stale"]]);
+  const result = setup.apply.result("package:stale");
+  assert.equal(result?.phase, "updated");
+  assert.equal(result?.unverified, true);
+  // The stale row keeps its old version; no fresh one is claimed.
+  assert.equal(rowsBySpec(setup).get("stale")?.installedVersion, "1.0.0");
+});
+
+test("the update flow leaves V1 pending state untouched", async (t) => {
+  const inventory = [packageInfo("stale", { version: "1.0.0" })];
+  const checked = [packageInfo("stale", { version: "1.0.0", outdated: true })];
+  const host = createHost(t, { inventory, checked });
+  host.registry.set("stale", () => ({ version: "1.1.0" }));
+  const pending = [{ kind: "plugin", spec: "v1-plugin" }];
+  host.backing.files.set("plugin-updates.pending", JSON.stringify(pending));
+  host.backing.files.set("plugin-updates.lastCheck", "42");
+
+  const setup = host.setup();
+  await setup.model.start();
+  commandByBind(setup, "a").run();
+  const installed = [packageInfo("stale", { version: "1.1.0" })];
+  let applied = false;
+  host.setList(async () => ({ data: applied ? installed : inventory }));
+  host.setCheck(async () => ({ data: applied ? installed : checked }));
+  host.setUpdate(() => {
+    applied = true;
+    return Promise.resolve();
+  });
+  host.setConfirm(() => true);
+  await commandByBind(setup, "u").run();
+
+  assert.deepEqual(host.requests.update.map((call) => call.targets), [["stale"]]);
+  assert.deepEqual(JSON.parse(host.backing.files.get("plugin-updates.pending") as string), pending);
+  assert.equal(host.backing.files.get("plugin-updates.lastCheck"), "42");
+  assert.deepEqual(host.storageKeys, ["plugin-updates.v2"]);
+});
+
+test("cleanup aborts an in-flight update and never sends the rest", async (t) => {
+  const inventory = [packageInfo("a-pkg", { version: "1.0.0" }), packageInfo("b-pkg", { version: "1.0.0" })];
+  const checked = [
+    packageInfo("a-pkg", { version: "1.0.0", outdated: true }),
+    packageInfo("b-pkg", { version: "1.0.0", outdated: true }),
+  ];
+  const host = createHost(t, { inventory, checked });
+  host.registry.set("a-pkg", () => ({ version: "1.1.0" }));
+  host.registry.set("b-pkg", () => ({ version: "1.1.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+  commandByBind(setup, "a").run();
+
+  const gate = deferred<void>();
+  host.setUpdate(() => gate.promise.then(() => undefined));
+  host.setConfirm(() => true);
+  const running = commandByBind(setup, "u").run() as Promise<void>;
+  await flush();
+  assert.deepEqual(host.requests.update.map((call) => call.targets), [["a-pkg"]]);
+  const signal = host.requests.update[0]?.signal;
+
+  host.backing.files.set("plugin-updates.pending", JSON.stringify([{ kind: "plugin", spec: "v1" }]));
+  setup.cleanup();
+  assert.equal(signal?.aborted, true);
+
+  gate.resolve();
+  await flush();
+  assert.deepEqual(host.requests.update.map((call) => call.targets), [["a-pkg"]]); // b-pkg is never sent
+  assert.equal(
+    host.backing.files.get("plugin-updates.pending"),
+    JSON.stringify([{ kind: "plugin", spec: "v1" }]),
+  );
 });

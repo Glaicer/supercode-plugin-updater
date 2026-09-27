@@ -52,6 +52,10 @@ export interface SemverTriple {
   patch: number;
 }
 
+export function errorMessage(reason: unknown): string {
+  return reason instanceof Error ? reason.message : String(reason);
+}
+
 // Prerelease and build suffixes are intentionally ignored.
 export function parseTriple(version: unknown): SemverTriple | undefined {
   if (typeof version !== "string") return undefined;

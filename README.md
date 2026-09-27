@@ -1,8 +1,8 @@
 # plugin-updater
 
-## V2 worktree (tickets 01–02, not published)
+## V2 worktree (tickets 01–03, not published)
 
-This checkout targets OpenCode 2.0.16. Its compiled `./tui` entrypoint provides `/plugin-updates` with the non-builtin plugins of the connected server: installed versions from the server inventory, the host's outdated flag plus public-npm `latest` metadata, a 24h automatic check with one toast when updates appear, and a manual `R` refresh that ignores the TTL. Selection, updates, TUI-only packages, and managed tools are not implemented yet. The released `0.3.0` package is still V1; do not use the installation instructions below for this worktree.
+This checkout targets OpenCode 2.0.16. Its compiled `./tui` entrypoint provides `/plugin-updates` with the non-builtin plugins of the connected server: installed versions from the server inventory, the host's outdated flag plus public-npm `latest` metadata, a 24h automatic check with one toast when updates appear, and a manual `R` refresh that ignores the TTL. Outdated server plugins are selectable (Space / A), `U` confirms a live update through the connected server (`client.plugin.update`, one target at a time), and the screen shows progress, per-package results and the version actually installed after the server re-activates. TUI-only packages and managed tools are not implemented yet. The released `0.3.0` package is still V1; do not use the installation instructions below for this worktree.
 
 For a local V2 test, run `node scripts/build.mjs` and add this directory's **absolute path** to the `plugins` array in global `~/.config/opencode/cli.json`, then start OpenCode 2.0.16. The root `tui.js` loads the compiled `dist/update-checker.js` for directory-based discovery; the package's `./tui` export points directly to the same compiled file. Verify with `npm run typecheck`, `npm test`, and the isolated host probe in `../../.scratch/041-update-checker-v2/probe/RESULTS.md`.
 

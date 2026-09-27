@@ -1,5 +1,6 @@
 import { createSignal } from "solid-js";
 import {
+  errorMessage,
   isUpdateAvailable,
   mapPool,
   withTimeout,
@@ -48,6 +49,11 @@ export const EMPTY_SERVER_STATE: StoredServerState = {
   rows: [],
 };
 
+/** Row identity for a package target; the apply model records outcomes by it. */
+export function packageRowId(target: string): string {
+  return `package:${target}`;
+}
+
 export type Freshness = "fresh" | "stale";
 
 export interface ServerUpdatesOptions {
@@ -69,9 +75,15 @@ export interface ServerUpdates {
   checkFailed(): boolean;
   updateCount(): number;
   /** Automatic cycle: honours the 24h TTL and may toast. */
-  start(): Promise<void>;
+  start(): Promise<boolean>;
   /** Manual cycle: ignores the TTL and never toasts. */
-  refresh(): Promise<void>;
+  refresh(): Promise<boolean>;
+  /**
+   * Post-update re-read: lets any in-flight cycle drain, then runs a manual
+   * cycle so the rows reflect the operation just applied. Resolves to whether
+   * the fresh inventory was actually read.
+   */
+  reread(): Promise<boolean>;
   dispose(): void;
 }
 
@@ -86,10 +98,6 @@ interface Composed {
   attempted: number;
   failed: number;
   updates: number;
-}
-
-function errorMessage(reason: unknown): string {
-  return reason instanceof Error ? reason.message : String(reason);
 }
 
 function inventoryKey(entries: readonly InventoryPlugin[]): string {
@@ -150,7 +158,7 @@ async function composeRows(
 
     const target = entry.source.target;
     const common = {
-      id: `package:${target}`,
+      id: packageRowId(target),
       spec: target,
       ...(entry.source.version === undefined ? {} : { installedVersion: entry.source.version }),
       ...failure,
@@ -229,10 +237,10 @@ export function createServerUpdates(options: ServerUpdatesOptions): ServerUpdate
 
   const controller = new AbortController();
   let disposed = false;
-  let cycle: Promise<void> | undefined;
+  let cycle: Promise<boolean> | undefined;
 
-  async function runCycle(manual: boolean): Promise<void> {
-    if (disposed) return;
+  async function runCycle(manual: boolean): Promise<boolean> {
+    if (disposed) return false;
     setChecking(true);
     try {
       const environment = options.environment();
@@ -244,12 +252,12 @@ export function createServerUpdates(options: ServerUpdatesOptions): ServerUpdate
       try {
         entries = await options.inventory.list(controller.signal);
       } catch (reason) {
-        if (disposed) return;
+        if (disposed) return false;
         setError(errorMessage(reason));
         setFreshness("stale");
-        return;
+        return false;
       }
-      if (disposed) return;
+      if (disposed) return false;
       setError("");
 
       const key = inventoryKey(entries);
@@ -263,7 +271,7 @@ export function createServerUpdates(options: ServerUpdatesOptions): ServerUpdate
         setRows(stored.rows);
         setFreshness("fresh");
         setCheckFailed(false);
-        return;
+        return true;
       }
 
       let checked: readonly InventoryPlugin[] | undefined;
@@ -274,7 +282,7 @@ export function createServerUpdates(options: ServerUpdatesOptions): ServerUpdate
         } catch {
           hostChecked = false;
         }
-        if (disposed) return;
+        if (disposed) return false;
       }
 
       const composed = await composeRows(checked ?? entries, {
@@ -284,7 +292,7 @@ export function createServerUpdates(options: ServerUpdatesOptions): ServerUpdate
         signal: controller.signal,
         hostChecked,
       });
-      if (disposed) return;
+      if (disposed) return false;
 
       setRows(composed.rows);
       setCheckFailed(!hostChecked);
@@ -304,27 +312,30 @@ export function createServerUpdates(options: ServerUpdatesOptions): ServerUpdate
       } catch {
         // Durable state is best-effort; the in-memory cycle result still renders.
       }
-      if (disposed) return;
+      if (disposed) return false;
       if (!manual && complete && composed.updates > 0) toast(updatesToastMessage(composed.updates));
+      return true;
     } catch (reason) {
       if (!disposed) {
         setError(errorMessage(reason));
         setFreshness("stale");
       }
+      return false;
     } finally {
       if (!disposed) setChecking(false);
     }
   }
 
-  function run(manual: boolean): Promise<void> {
+  function run(manual: boolean): Promise<boolean> {
     if (cycle !== undefined) return cycle;
     cycle = (async () => {
       try {
         // Keep the caller's current tick free of network work.
         await Promise.resolve();
-        await runCycle(manual);
+        return await runCycle(manual);
       } catch {
         // runCycle isolates its own failures; this only keeps the shared promise from rejecting.
+        return false;
       } finally {
         cycle = undefined;
       }
@@ -341,6 +352,12 @@ export function createServerUpdates(options: ServerUpdatesOptions): ServerUpdate
     updateCount: () => rows().filter((row) => row.status === "update").length,
     start: () => run(false),
     refresh: () => run(true),
+    async reread() {
+      // A cycle that started before the updates applied carries their old
+      // inventory; drain it so this re-read starts after the operation.
+      while (cycle !== undefined) await cycle;
+      return run(true);
+    },
     dispose() {
       disposed = true;
       controller.abort();
