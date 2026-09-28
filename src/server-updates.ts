@@ -446,6 +446,22 @@ export function countUpdateTargets(rows: readonly ServerRow[]): number {
   return new Set(rows.filter((row) => row.status === "update").map((row) => row.spec)).size;
 }
 
+/**
+ * The rows the screen lists: one line per plugin. A shared Server/TUI pair
+ * renders as its server copy (the host verdict, and an outdated server half
+ * must stay visible), and local-path plugins are development fixtures the
+ * screen never lists. The model keeps every row; selection and settling still
+ * see both halves of a pair.
+ */
+export function listedRows(rows: readonly ServerRow[]): ServerRow[] {
+  return rows.filter(
+    (row) =>
+      !(row.runtime === "tui" && row.twin !== undefined) &&
+      row.reason !== "local path" &&
+      row.reason !== "file path",
+  );
+}
+
 export function updatesToastMessage(count: number): string {
   return `${count} OpenCode updates available. Run /plugin-updates to review them.`;
 }

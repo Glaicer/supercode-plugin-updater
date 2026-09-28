@@ -8,7 +8,7 @@ import { dirname, join } from "node:path";
 import type { Plugin } from "@opencode/plugin/tui";
 import { createManagedToolsPort, createServerLocalityPort } from "./managed-tools.ts";
 import type { ServerApply } from "./server-apply.ts";
-import type { ServerRow, ServerUpdates } from "./server-updates.ts";
+import { listedRows, type ServerRow, type ServerUpdates } from "./server-updates.ts";
 import type { CliUpdateResult, TuiPackagePort } from "./tui-packages.ts";
 import { installGeneration } from "./test-generations.ts";
 
@@ -820,7 +820,7 @@ test("Space and A select only updatable rows", async (t) => {
     packageInfo("stale", { version: "1.0.0" }),
     packageInfo("fresh", { version: "2.0.0" }),
     packageInfo("pinned@1.0.0", { version: "1.0.0" }),
-    localInfo("/home/me/local"),
+    sdkInfo("sdk-one"),
   ];
   const checked = [packageInfo("stale", { version: "1.0.0", outdated: true }), ...inventory.slice(1)];
   const host = createHost(t, { inventory, checked });
@@ -872,8 +872,7 @@ test("U lists the selection with a live-server warning, and cancel sends nothing
   assert.equal(host.confirms.length, 1);
   const dialog = host.confirms[0];
   assert.equal(dialog.title, "Update plugins");
-  assert.match(dialog.message, /server stale/);
-  assert.match(dialog.message, /1\.0\.0 → 1\.1\.0/);
+  assert.match(dialog.message, /· stale 1\.0\.0 → 1\.1\.0/);
   assert.match(dialog.message, /live/);
   assert.deepEqual(dialog.label, { confirm: "Update", cancel: "Cancel" });
   // The default fake answer is cancel: no update may leave the screen.
@@ -1269,6 +1268,39 @@ test("the effective TUI inventory omits targets the TUI cannot load", async (t) 
   assert.equal(setup.apply.selected().size, 0); // skipped and pinned rows never enter the selection
 });
 
+test("the screen lists one line per plugin: a shared pair collapses to its server copy, local paths never list", async (t) => {
+  const inventory = [
+    packageInfo("exposed", { version: "1.0.0", tui: true }),
+    packageInfo("server-only", { version: "1.0.0" }),
+    localInfo("./plugins/notify"),
+  ];
+  const host = createHost(t, { inventory, checked: inventory });
+  host.tui.targets = ["exposed", "tui-only", "/local/plugin"];
+  host.tui.versions.set("exposed", "1.0.0");
+  host.tui.versions.set("tui-only", "1.0.0");
+  host.registry.set("exposed", () => ({ version: "1.0.0" }));
+  host.registry.set("server-only", () => ({ version: "1.0.0" }));
+  host.registry.set("tui-only", () => ({ version: "1.0.0" }));
+
+  const setup = host.setup();
+  await setup.model.start();
+
+  // The model keeps both halves of a pair and the local rows: selection and
+  // the settle poll still walk them.
+  assert.deepEqual(setup.model.rows().map((row) => row.id), [
+    "package:exposed",
+    "package:server-only",
+    "local:./plugins/notify",
+    "tui:exposed",
+    "tui:tui-only",
+    "tui:/local/plugin",
+  ]);
+  assert.deepEqual(
+    listedRows(setup.model.rows()).map((row) => row.id),
+    ["package:exposed", "package:server-only", "tui:tui-only"],
+  );
+});
+
 test("a shared twin whose cache is already ahead stays current while the server row updates", async (t) => {
   t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: START });
   const inventory = [packageInfo("shared", { version: "1.0.0", tui: true })];
@@ -1315,7 +1347,7 @@ test("a shared twin whose cache is already ahead stays current while the server 
   assert.match(tuiResult?.message ?? "", /did not confirm/);
 });
 
-test("Space selects the whole shared group, the confirmation lists both runtimes, and cancel sends nothing", async (t) => {
+test("Space selects the whole shared group, the confirmation lists the plugin once, and cancel sends nothing", async (t) => {
   const inventory = [packageInfo("shared", { version: "1.0.0", tui: true })];
   const checked = [packageInfo("shared", { version: "1.0.0", outdated: true, tui: true })];
   const host = createHost(t, { inventory, checked });
@@ -1332,8 +1364,8 @@ test("Space selects the whole shared group, the confirmation lists both runtimes
   await commandByBind(setup, "u").run();
   assert.equal(host.confirms.length, 1);
   const dialog = host.confirms[0];
-  assert.match(dialog.message, /· server shared 1\.0\.0 → 1\.1\.0/);
-  assert.match(dialog.message, /· tui shared 1\.0\.0 → 1\.1\.0/);
+  assert.match(dialog.message, /· shared 1\.0\.0 → 1\.1\.0/);
+  assert.equal(dialog.message.match(/· shared/g)?.length, 1); // one line per plugin, not one per runtime
   assert.match(dialog.message, /applies these updates live/);
   assert.match(dialog.message, /until it restarts/);
   assert.match(dialog.message, /either or both runtimes/);

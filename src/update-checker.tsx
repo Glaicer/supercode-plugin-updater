@@ -20,6 +20,7 @@ import {
   createServerUpdates,
   effectiveTuiTargets,
   EMPTY_SERVER_STATE,
+  listedRows,
   STORAGE_KEY,
   type ServerRow,
   type ServerUpdates,
@@ -41,6 +42,9 @@ const SETTLE_DELAY_MS = 500;
 
 function version(row: ServerRow): string {
   if (row.status === "update") return `${row.installedVersion ?? "unknown"} → ${row.latestVersion ?? "unknown"}`;
+  // An up-to-date plugin reads as its installed version alone; the arrow pair
+  // would only repeat what that already says.
+  if (row.status === "current") return row.installedVersion ?? "";
   if (row.installedVersion !== undefined && row.latestVersion !== undefined) {
     return `${row.installedVersion} → ${row.latestVersion}`;
   }
@@ -50,14 +54,13 @@ function version(row: ServerRow): string {
 }
 
 function status(row: ServerRow): string {
-  // Managed tools are informational: no key updates them, so every tool row
-  // says so explicitly.
+  // Managed tools are informational: no key updates them.
   const infoOnly = row.runtime === "tool" ? " · info only" : "";
   switch (row.status) {
     case "update":
       return `update available${infoOnly}`;
     case "current":
-      return `current${infoOnly}`;
+      return "";
     case "unknown":
       return `unknown: ${row.reason ?? "unverified"}${infoOnly}`;
     case "pinned":
@@ -68,7 +71,7 @@ function status(row: ServerRow): string {
 }
 
 function line(row: ServerRow): string {
-  const parts = [row.runtime, row.spec, version(row), status(row)].filter((part) => part.length > 0);
+  const parts = [row.spec, version(row), status(row)].filter((part) => part.length > 0);
   return `${parts.join("  ·  ")}${row.failed ? `  ·  failed: ${row.failed}` : ""}`;
 }
 
@@ -94,8 +97,11 @@ function outcome(row: ServerRow, apply: ServerApply): string {
       if (row.failed !== undefined) return "updated · activation failed";
       const settled = `updated · now ${row.installedVersion ?? "unknown"}`;
       // Package entrypoints never re-resolve inside a running TUI, so a moved
-      // installed version is observable while the loaded one stays behind.
-      return row.runtime === "tui" ? `${settled} · restart TUI to activate` : settled;
+      // installed version is observable while the loaded one stays behind. A
+      // listed shared row stands for its TUI half too and carries the notice.
+      return row.runtime === "tui" || row.shared === true
+        ? `${settled} · restart TUI to activate`
+        : settled;
   }
 }
 
@@ -139,9 +145,16 @@ function statusLine(model: ServerUpdates): string {
 }
 
 function confirmationMessage(rows: readonly ServerRow[]): string {
-  const listing = rows.map((row) => {
+  // One line per plugin: a shared pair is sent as one target and listed once,
+  // preferring the half that actually carries the update.
+  const bySpec = new Map<string, ServerRow>();
+  for (const row of rows) {
+    const kept = bySpec.get(row.spec);
+    if (kept === undefined || (kept.status !== "update" && row.status === "update")) bySpec.set(row.spec, row);
+  }
+  const listing = [...bySpec.values()].map((row) => {
     const pair = version(row);
-    return `· ${row.runtime} ${row.spec}${pair ? ` ${pair}` : ""}`;
+    return `· ${row.spec}${pair ? ` ${pair}` : ""}`;
   });
   const lines = [...listing];
   if (rows.some((row) => row.runtime === "server")) {
@@ -165,14 +178,17 @@ function Screen(props: {
 }) {
   const { context, model, apply } = props;
   const [cursor, setCursor] = createSignal(0);
-  const focus = () => Math.max(0, Math.min(cursor(), model.rows().length - 1));
-  const move = (delta: number) => setCursor(focus() + delta);
   // One membership computation per render, not one per row.
   const sendable = () => new Set(apply.selectedRows(model.rows()).map((row) => row.id));
+  // The screen walks the listed rows; the model keeps the hidden halves and
+  // local paths for the apply machinery and the settle poll.
+  const listed = () => listedRows(model.rows());
+  const focus = () => Math.max(0, Math.min(cursor(), listed().length - 1));
+  const move = (delta: number) => setCursor(focus() + delta);
   // Managed tools render as their own read-only section after the plugin rows;
   // the model always composes them last.
-  const pluginRows = () => model.rows().filter((row) => row.runtime !== "tool");
-  const toolRows = () => model.rows().filter((row) => row.runtime === "tool");
+  const pluginRows = () => listed().filter((row) => row.runtime !== "tool");
+  const toolRows = () => listed().filter((row) => row.runtime === "tool");
   const toolsNote = (): string | undefined => {
     const availability = model.toolsAvailability();
     if (availability === undefined) return undefined;
@@ -207,7 +223,7 @@ function Screen(props: {
         bind: "space",
         title: "Select plugin",
         run: () => {
-          const row = model.rows()[focus()];
+          const row = listed()[focus()];
           if (row !== undefined) apply.toggle(row);
         },
       },
@@ -219,13 +235,18 @@ function Screen(props: {
   return (
     <box flexDirection="column" width="100%" height="100%" paddingLeft={1}>
       <text fg={context.theme.text.base}><b>Plugin Updates</b></text>
-      <text fg={context.theme.text.muted}>{statusLine(model)}  ·  R refresh · Esc back</text>
+      <text fg={context.theme.text.muted}>
+        {statusLine(model)}  ·  ↑/↓/j/k move · Space select · A select all · U update · R refresh · Esc back
+      </text>
+      <box height={1} />
+      <text fg={context.theme.text.muted}>Plugins</text>
       <For each={pluginRows()}>
         {(row, index) => (
           <text fg={context.theme.text.base}>{rowLine(row, index(), focus(), apply, sendable())}</text>
         )}
       </For>
       <Show when={model.toolsAvailability() !== undefined}>
+        <box height={1} />
         <text fg={context.theme.text.muted}>Managed tools · info only — installed and updated by OpenCode itself</text>
         <For each={toolRows()}>
           {(row, index) => (
@@ -327,7 +348,7 @@ export default Plugin.define({
           commands: [{
             id: "supercode.plugin-updates.open",
             title: "Plugin updates",
-            description: "Show server and TUI plugin versions and updates",
+            description: "Show plugin and managed-tool versions and updates",
             palette: true,
             slash: { name: "plugin-updates" },
             run: () => {

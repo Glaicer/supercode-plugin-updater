@@ -42,18 +42,17 @@ Plugin options use the object form:
 Once per 24 hours for the same inventory and environment, and again freshly every time you open `/plugin-updates`:
 
 - If the automatic check finds updates, you get one toast: `N OpenCode updates available. Run /plugin-updates to review them.` Without updates it stays silent, and opening the screen never repeats the toast.
-- `/plugin-updates` (command palette or slash command) opens a screen with three groups:
+- `/plugin-updates` (command palette or slash command) opens a screen with two sections:
 
-  - **Server plugins** — the non-builtin plugins of the connected server, with the installed and available version. After you confirm, the update applies **live**: the running server picks up the new plugin behavior without a restart.
-  - **TUI packages** — your `cli.json` targets plus the TUI halves the server exposes. A confirmed update installs a new package generation; the running TUI keeps the loaded version **until it restarts**, and the row says so explicitly (`restart TUI to activate`).
+  - **Plugins** — one line per plugin, with the installed and available version. A plugin that is up to date reads as its installed version alone. A package loaded by both the server and the TUI is listed once and updates both halves; local-path plugins are development fixtures and are never listed. After you confirm, a server half applies **live**: the running server picks up the new plugin behavior without a restart. A TUI half installs a new package generation; the running TUI keeps the loaded version **until it restarts**, and the row says so explicitly (`restart TUI to activate`).
   - **Managed tools** — the formatters OpenCode installs itself (`prettier`, `oxfmt`, `@biomejs/biome`), marked `info only`. They are never selectable and no key updates them; OpenCode manages their lifecycle. The section appears only when the connected server provably runs on this machine — for a remote (or unverifiable) connection the formatters belong to that other machine and the section reports itself unavailable instead of reading the local cache.
 
-- Select what you want (`Space` / `A`), press `U`, and confirm. The confirmation lists every selected row and warns what each runtime does: server updates change the live server, TUI updates take effect on the next restart, and a target shared by both runtimes is sent to the standard CLI **once** — it re-checks and may update either or both runtimes.
+- Select what you want (`Space` / `A`), press `U`, and confirm. The confirmation lists every selected plugin once and warns what each half does: server updates change the live server, TUI updates take effect on the next restart, and a plugin shared by both runtimes is sent to the standard CLI **once** — it re-checks and may update either or both runtimes.
 
 | Key | Action |
 | --- | --- |
 | `j` / `k` or arrows | Move the cursor |
-| Space | Toggle the package under the cursor (a shared Server+TUI target selects both rows) |
+| Space | Toggle the plugin under the cursor (a plugin shared by the server and the TUI selects both halves) |
 | `A` | Select every selectable package |
 | `U` | Update the selection (confirmation dialog first) |
 | `R` | Re-check now, ignoring the 24h timer |
