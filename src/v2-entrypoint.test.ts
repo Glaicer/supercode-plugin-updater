@@ -780,7 +780,7 @@ test("V1 keys in the host store are neither read, executed, nor merged into the 
   const setup = host.setup();
   await setup.model.start();
 
-  assert.deepEqual(host.storageKeys, ["plugin-updates.v2"]);
+  assert.deepEqual(host.storageKeys, ["plugin-updates.v2", "plugin-updates.v2.pending-tools"]);
   assert.deepEqual(JSON.parse(host.backing.files.get("plugin-updates.pending") as string), pending);
   assert.equal(setup.model.rows().length, 0);
   assert.equal(setup.model.updateCount(), 0);
@@ -1148,7 +1148,7 @@ test("the update flow leaves V1 pending state untouched", async (t) => {
   assert.deepEqual(host.requests.update.map((call) => call.targets), [["stale"]]);
   assert.deepEqual(JSON.parse(host.backing.files.get("plugin-updates.pending") as string), pending);
   assert.equal(host.backing.files.get("plugin-updates.lastCheck"), "42");
-  assert.deepEqual(host.storageKeys, ["plugin-updates.v2"]);
+  assert.deepEqual(host.storageKeys, ["plugin-updates.v2", "plugin-updates.v2.pending-tools"]);
 });
 
 test("cleanup aborts an in-flight update and never sends the rest", async (t) => {
@@ -1688,7 +1688,7 @@ test("cleanup aborts a running CLI operation and sends nothing further", async (
   assert.deepEqual(host.cliCalls.map((call) => call.target), ["tui-only"]); // no retry, no second call
 });
 
-test("installed formatters render as info-only rows, join the count and toast, and never enter the selection", async (t) => {
+test("installed formatters join the count and toast; only one with a confirmed update is selectable", async (t) => {
   const host = createHost(t, { inventory: [] });
   const manifest = installGeneration(host.cacheDir, "prettier", "1", "3.0.0");
   installGeneration(host.cacheDir, "prettier", "2", "3.1.0");
@@ -1713,14 +1713,13 @@ test("installed formatters render as info-only rows, join the count and toast, a
   assert.equal(host.requests.check.length, 0); // no plugin targets: no host check
   assert.deepEqual(setup.model.toolsAvailability(), { available: true });
 
-  // Space and A never mark a managed tool, so U opens no confirmation.
-  commandByBind(setup, "a").run();
-  assert.equal(setup.apply.selected().size, 0);
-  commandByBind(setup, "space").run();
-  assert.equal(setup.apply.selected().size, 0);
+  // A managed tool with a confirmed update is selectable; a current one is not.
+  // U is the plugin action and never updates a tool.
+  commandByBind(setup, "a").run(); // select all updatable → prettier only
+  assert.deepEqual([...setup.apply.selected()], ["tool:prettier"]);
   commandByBind(setup, "down").run();
-  commandByBind(setup, "space").run();
-  assert.equal(setup.apply.selected().size, 0);
+  commandByBind(setup, "space").run(); // @biomejs/biome is current — not updatable
+  assert.deepEqual([...setup.apply.selected()], ["tool:prettier"]);
   await commandByBind(setup, "u").run();
   assert.deepEqual(host.confirms, []);
   assert.deepEqual(host.requests.update, []);

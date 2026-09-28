@@ -10,6 +10,11 @@ import type { DurableState } from "./durable-state.ts";
 import type { LocalityPort, ManagedTool, ManagedToolsPort } from "./managed-tools.ts";
 import { classifyPluginSpec } from "./plugins.ts";
 import type { InventoryPlugin, InventoryPort } from "./server-inventory.ts";
+import {
+  reconcilePendingTool,
+  type PendingTool,
+  type ToolReinstallOutcome,
+} from "./tool-reinstall.ts";
 import type { TuiPackagePort } from "./tui-packages.ts";
 
 export const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -17,6 +22,7 @@ export const REGISTRY_TIMEOUT_MS = 5000;
 export const REGISTRY_CONCURRENCY = 4;
 // A new key: V1 state is never read, migrated, or acted on.
 export const STORAGE_KEY = "plugin-updates.v2";
+export const PENDING_TOOLS_KEY = "plugin-updates.v2.pending-tools";
 export const STORAGE_VERSION = 2;
 
 export type Runtime = "server" | "tui";
@@ -65,6 +71,13 @@ export const EMPTY_SERVER_STATE: StoredServerState = {
   rows: [],
 };
 
+/** Durable record of managed tools mid-reinstall, keyed separately from the check snapshot. */
+export interface PendingToolsState {
+  entries: PendingTool[];
+}
+
+export const EMPTY_PENDING_TOOLS: PendingToolsState = { entries: [] };
+
 /** Row identity for a package target; the apply model records outcomes by it. */
 export function packageRowId(target: string): string {
   return `package:${target}`;
@@ -89,6 +102,8 @@ export interface ServerUpdatesOptions {
   /** Whether the connected server provably runs on this machine. */
   readonly locality: LocalityPort;
   readonly state: DurableState<StoredServerState>;
+  /** Managed tools mid-reinstall; survives TUI restarts and keys the pending display. */
+  readonly pending: DurableState<PendingToolsState>;
   readonly environment: () => string;
   readonly fetchLatest: FetchLatest;
   readonly now?: () => number;
@@ -112,6 +127,15 @@ export interface ServerUpdates {
   checkedEnvironment(): string;
   /** The managed-tools section state of the last cycle, or undefined before one ran. */
   toolsAvailability(): ToolsAvailability | undefined;
+  /**
+   * The live reinstall overlay for one managed tool, or undefined when it is
+   * not mid-reinstall. Recomputed from the pending record and the current
+   * cache, so it is never stale: an invalidated tool reads `pending` until the
+   * cache actually shows a reinstall.
+   */
+  toolReinstallOutcome(name: string): ToolReinstallOutcome | undefined;
+  /** Record managed tools as mid-reinstall (called when the operation is confirmed). */
+  markToolsPending(entries: readonly PendingTool[]): Promise<void>;
   /** Automatic cycle: honours the 24h TTL and may toast. */
   start(): Promise<boolean>;
   /** Manual cycle: ignores the TTL and never toasts. */
@@ -290,6 +314,7 @@ async function composeRows(
   entries: readonly InventoryPlugin[],
   tui: TuiPackagePort,
   tools: readonly ManagedTool[],
+  pending: readonly PendingTool[],
   options: {
     fetchLatest: FetchLatest;
     timeoutMs: number;
@@ -343,17 +368,22 @@ async function composeRows(
   }
 
   const toolRows: ServerRow[] = [];
-  for (const tool of tools) {
+  const installedByName = new Map(tools.map((tool) => [tool.name, tool]));
+  // A tool mid-reinstall may have no cache yet; it still belongs on screen as
+  // awaiting reinstallation, so the row set is installed ∪ pending.
+  const toolNames = [...new Set([...installedByName.keys(), ...pending.map((entry) => entry.name)])];
+  for (const name of toolNames) {
+    const tool = installedByName.get(name);
     const row: ServerRow = {
-      id: toolRowId(tool.name),
+      id: toolRowId(name),
       runtime: "tool",
-      spec: tool.name,
-      name: tool.name,
+      spec: name,
+      name,
       status: "unknown",
-      ...(tool.version === undefined ? {} : { installedVersion: tool.version }),
+      ...(tool?.version === undefined ? {} : { installedVersion: tool.version }),
     };
     toolRows.push(row);
-    checkable.push({ row, name: tool.name });
+    checkable.push({ row, name });
   }
 
   const names = [...new Set(checkable.map((item) => item.name))];
@@ -519,6 +549,7 @@ export function createServerUpdates(options: ServerUpdatesOptions): ServerUpdate
         ? { available: true }
         : { available: false, reason: verdict.reason };
       const tools = verdict.local ? options.tools.installed() : undefined;
+      const pendingEntries = verdict.local ? options.pending.read().entries : [];
       setToolsAvailability(availability);
 
       const key = inventoryKey(entries, effectiveTuiTargets(entries, options.tui), tools);
@@ -549,7 +580,7 @@ export function createServerUpdates(options: ServerUpdatesOptions): ServerUpdate
         if (disposed) return false;
       }
 
-      const composed = await composeRows(checked ?? entries, options.tui, tools ?? [], {
+      const composed = await composeRows(checked ?? entries, options.tui, tools ?? [], pendingEntries, {
         fetchLatest: options.fetchLatest,
         timeoutMs,
         concurrency,
@@ -577,6 +608,17 @@ export function createServerUpdates(options: ServerUpdatesOptions): ServerUpdate
         });
       } catch {
         // Durable state is best-effort; the in-memory cycle result still renders.
+      }
+      // Drop pending tools the cache now proves reinstalled: only an actual new
+      // version resolves a pending entry, never the invalidation on its own.
+      try {
+        const currentVersion = new Map((tools ?? []).map((tool) => [tool.name, tool.version]));
+        const remaining = pendingEntries.filter(
+          (entry) => reconcilePendingTool(entry, currentVersion.get(entry.name), now()).phase !== "reinstalled",
+        );
+        if (remaining.length !== pendingEntries.length) await options.pending.write({ entries: remaining });
+      } catch {
+        // Pending state is best-effort; a stale entry simply re-reconciles next cycle.
       }
       if (disposed) return false;
       if (!manual && complete && composed.updates > 0) toast(updatesToastMessage(composed.updates));
@@ -619,6 +661,15 @@ export function createServerUpdates(options: ServerUpdatesOptions): ServerUpdate
     updateCount: () => countUpdateTargets(rows()),
     checkedEnvironment: () => lastEnvironment,
     toolsAvailability,
+    toolReinstallOutcome(name) {
+      const entry = options.pending.read().entries.find((candidate) => candidate.name === name);
+      if (entry === undefined) return undefined;
+      const currentVersion = options.tools.installed().find((tool) => tool.name === name)?.version;
+      return reconcilePendingTool(entry, currentVersion, now());
+    },
+    markToolsPending(entries) {
+      return options.pending.write({ entries: [...entries] });
+    },
     start: () => run(false),
     refresh: () => run(true),
     async reread() {

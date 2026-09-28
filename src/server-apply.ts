@@ -95,6 +95,10 @@ export interface ServerApply {
    * up-to-date.
    */
   selectedRows(rows: readonly ServerRow[]): ServerRow[];
+  /** The plugin subset of `selectedRows`; the only rows an update may act on. */
+  selectedPluginRows(rows: readonly ServerRow[]): ServerRow[];
+  /** The managed-tool subset of `selectedRows`; reinstallable, never updated live. */
+  selectedToolRows(rows: readonly ServerRow[]): ServerRow[];
   result(id: string): ApplyResult | undefined;
   results(): ReadonlyMap<string, ApplyResult>;
   running(): boolean;
@@ -110,13 +114,11 @@ export interface ServerApply {
 
 /**
  * A row can receive an update right now: the host confirmed one is available
- * and no operation is running for it. Managed tool rows are informational and
- * can never receive an update.
+ * and no operation is running for it. A managed tool with a confirmed update is
+ * selectable too, but for reinstall + server restart — never a live update.
  */
 function isUpdatable(row: ServerRow, results: ReadonlyMap<string, ApplyResult>): boolean {
-  return (
-    row.status === "update" && row.runtime !== "tool" && results.get(row.id)?.phase !== "updating"
-  );
+  return row.status === "update" && results.get(row.id)?.phase !== "updating";
 }
 
 interface CliVerdict {
@@ -243,6 +245,9 @@ export function createServerApply(ports: ServerApplyPorts): ServerApply {
 
   async function execute(rows: readonly ServerRow[]): Promise<void> {
     if (operation !== undefined) return operation;
+    // Managed tools never travel the live-update path; only plugin rows do.
+    rows = rows.filter((row) => row.runtime !== "tool");
+    if (rows.length === 0) return;
     setRunning(true);
     operation = (async () => {
       try {
@@ -365,6 +370,14 @@ export function createServerApply(ports: ServerApplyPorts): ServerApply {
     return operation;
   }
 
+  function computeSelectedRows(rows: readonly ServerRow[]): ServerRow[] {
+    const marked = selected();
+    const updatable = new Set(rows.filter((row) => isUpdatable(row, results())).map((row) => row.id));
+    return rows.filter(
+      (row) => marked.has(row.id) && (updatable.has(row.id) || (row.twin !== undefined && updatable.has(row.twin))),
+    );
+  }
+
   return {
     selected,
     toggle(row) {
@@ -384,12 +397,12 @@ export function createServerApply(ports: ServerApplyPorts): ServerApply {
       });
     },
     clearSelection,
-    selectedRows(rows) {
-      const marked = selected();
-      const updatable = new Set(rows.filter((row) => isUpdatable(row, results())).map((row) => row.id));
-      return rows.filter(
-        (row) => marked.has(row.id) && (updatable.has(row.id) || (row.twin !== undefined && updatable.has(row.twin))),
-      );
+    selectedRows: computeSelectedRows,
+    selectedPluginRows(rows) {
+      return computeSelectedRows(rows).filter((row) => row.runtime !== "tool");
+    },
+    selectedToolRows(rows) {
+      return computeSelectedRows(rows).filter((row) => row.runtime === "tool");
     },
     result: (id) => results().get(id),
     results,

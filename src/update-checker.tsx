@@ -6,6 +6,7 @@ import { createDurableState } from "./durable-state.ts";
 import {
   createManagedToolsPort,
   createServerLocalityPort,
+  managedCacheDirectory,
   type LocalityPort,
   type ManagedToolsPort,
 } from "./managed-tools.ts";
@@ -19,18 +20,33 @@ import {
 import {
   createServerUpdates,
   effectiveTuiTargets,
+  EMPTY_PENDING_TOOLS,
   EMPTY_SERVER_STATE,
   listedRows,
+  PENDING_TOOLS_KEY,
   STORAGE_KEY,
+  type PendingToolsState,
   type ServerRow,
   type ServerUpdates,
 } from "./server-updates.ts";
+import {
+  createManagedServerPort,
+  createServiceControlPort,
+  type ManagedServerPort,
+  type ServiceControlPort,
+} from "./service-control.ts";
 import {
   createCliUpdateRunner,
   createTuiPackagePort,
   type CliUpdateRunner,
   type TuiPackagePort,
 } from "./tui-packages.ts";
+import {
+  reinstallConfirmationMessage,
+  toolPhaseLabel,
+  type PendingTool,
+  type ToolReinstallOutcome,
+} from "./tool-reinstall.ts";
 
 const ROUTE = "plugin-updates";
 const ID = "supercode.update-checker";
@@ -40,7 +56,9 @@ const ID = "supercode.update-checker";
 const SETTLE_TIMEOUT_MS = 15_000;
 const SETTLE_DELAY_MS = 500;
 
-function version(row: ServerRow): string {
+function version(row: ServerRow, reinstall?: ToolReinstallOutcome): string {
+  // A managed tool mid-reinstall reports its phase, not a version pair.
+  if (reinstall !== undefined) return "";
   if (row.status === "update") return `${row.installedVersion ?? "unknown"} → ${row.latestVersion ?? "unknown"}`;
   // An up-to-date plugin reads as its installed version alone; the arrow pair
   // would only repeat what that already says.
@@ -53,16 +71,17 @@ function version(row: ServerRow): string {
   return "";
 }
 
-function status(row: ServerRow): string {
-  // Managed tools are informational: no key updates them.
-  const infoOnly = row.runtime === "tool" ? " · info only" : "";
+function status(row: ServerRow, reinstall?: ToolReinstallOutcome): string {
+  // A managed tool mid-reinstall shows the reinstall phase — never "updated"
+  // before the cache actually proves a reinstall.
+  if (reinstall !== undefined) return toolPhaseLabel(reinstall);
   switch (row.status) {
     case "update":
-      return `update available${infoOnly}`;
+      return "update available";
     case "current":
       return "";
     case "unknown":
-      return `unknown: ${row.reason ?? "unverified"}${infoOnly}`;
+      return `unknown: ${row.reason ?? "unverified"}`;
     case "pinned":
       return `pinned at ${row.pinnedVersion ?? "unknown"} · info only`;
     case "skipped":
@@ -70,8 +89,8 @@ function status(row: ServerRow): string {
   }
 }
 
-function line(row: ServerRow): string {
-  const parts = [row.spec, version(row), status(row)].filter((part) => part.length > 0);
+function line(row: ServerRow, reinstall?: ToolReinstallOutcome): string {
+  const parts = [row.spec, version(row, reinstall), status(row, reinstall)].filter((part) => part.length > 0);
   return `${parts.join("  ·  ")}${row.failed ? `  ·  failed: ${row.failed}` : ""}`;
 }
 
@@ -111,13 +130,14 @@ function rowLine(
   cursor: number,
   apply: ServerApply,
   sendable: ReadonlySet<string>,
+  reinstall?: ToolReinstallOutcome,
 ): string {
   const focus = index === cursor ? ">" : " ";
   // A stale mark (the row left the updatable set after a refresh) must not
   // read as a live selection; the send path filters it separately.
   const mark = sendable.has(row.id) ? "*" : " ";
   const result = outcome(row, apply);
-  return `${focus}${mark} ${line(row)}${result ? `  ·  ${result}` : ""}`;
+  return `${focus}${mark} ${line(row, reinstall)}${result ? `  ·  ${result}` : ""}`;
 }
 
 function applyStatus(apply: ServerApply): string {
@@ -174,9 +194,12 @@ function Screen(props: {
   context: Plugin.Context;
   model: ServerUpdates;
   apply: ServerApply;
+  managedServer: ManagedServerPort;
+  serviceControl: ServiceControlPort;
+  cacheDir: string;
   back: () => void;
 }) {
-  const { context, model, apply } = props;
+  const { context, model, apply, managedServer, serviceControl, cacheDir } = props;
   const [cursor, setCursor] = createSignal(0);
   // One membership computation per render, not one per row.
   const sendable = () => new Set(apply.selectedRows(model.rows()).map((row) => row.id));
@@ -199,8 +222,13 @@ function Screen(props: {
 
   const confirmUpdates = async () => {
     if (apply.running()) return;
-    const rows = apply.selectedRows(model.rows());
-    if (rows.length === 0) return;
+    const rows = apply.selectedPluginRows(model.rows());
+    if (rows.length === 0) {
+      if (apply.selectedToolRows(model.rows()).length > 0) {
+        context.ui.toast.show({ message: "Managed tools use X — reinstall & restart the server." });
+      }
+      return;
+    }
     const choice = await context.ui.dialog.confirm({
       title: "Update plugins",
       message: confirmationMessage(rows),
@@ -208,6 +236,69 @@ function Screen(props: {
     });
     if (choice !== true) return;
     await apply.execute(rows);
+  };
+
+  const confirmReinstall = async () => {
+    const rows = apply.selectedToolRows(model.rows());
+    if (rows.length === 0) {
+      if (apply.selectedPluginRows(model.rows()).length > 0) {
+        context.ui.toast.show({ message: "Plugins use U — update selected." });
+      }
+      return;
+    }
+    // The action stops and starts a shared server, so it is only available for
+    // the managed local daemon the TUI is provably connected to.
+    const verdict = await managedServer.verify();
+    if (!verdict.ok) {
+      context.ui.toast.show({ message: `Reinstall unavailable: ${verdict.reason}` });
+      return;
+    }
+    const choice = await context.ui.dialog.confirm({
+      title: "Reinstall managed tools and restart server",
+      message: reinstallConfirmationMessage(
+        rows.map((row) => ({
+          name: row.name,
+          ...(row.installedVersion === undefined ? {} : { installedVersion: row.installedVersion }),
+          ...(row.latestVersion === undefined ? {} : { latestVersion: row.latestVersion }),
+        })),
+      ),
+      label: { confirm: "Reinstall & restart", cancel: "Cancel" },
+    });
+    if (choice !== true) return;
+    let pid: number | undefined;
+    try {
+      pid = (await context.client.server.info()).pid;
+    } catch {
+      pid = undefined;
+    }
+    if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
+      context.ui.toast.show({ message: "Reinstall aborted: the server process is unknown." });
+      return;
+    }
+    // Persist first so the pending state survives the restart, then hand the
+    // sequence to a detached supervisor that outlives this handler.
+    await model.markToolsPending(
+      rows.map((row) => ({
+        name: row.name,
+        ...(row.installedVersion === undefined ? {} : { previousVersion: row.installedVersion }),
+        at: Date.now(),
+      })),
+    );
+    serviceControl.reinstall({ pid, cacheDir, names: rows.map((row) => row.name) });
+    apply.clearSelection();
+    void pollReinstall();
+  };
+
+  const pollReinstall = async () => {
+    for (let attempt = 0; attempt < 10; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      await model.reread();
+      const pending = toolRows().some((row) => {
+        const outcome = model.toolReinstallOutcome(row.name);
+        return outcome !== undefined && outcome.phase !== "reinstalled";
+      });
+      if (!pending) return;
+    }
   };
 
   context.keymap.layer(() => ({
@@ -228,7 +319,8 @@ function Screen(props: {
         },
       },
       { bind: "a", title: "Select all updatable", run: () => apply.selectAll(model.rows()) },
-      { bind: "u", title: "Update selected", run: () => confirmUpdates() },
+      { bind: "u", title: "Update selected plugins", run: () => confirmUpdates() },
+      { bind: "x", title: "Reinstall tools & restart server", run: () => confirmReinstall() },
     ],
   }));
 
@@ -236,7 +328,7 @@ function Screen(props: {
     <box flexDirection="column" width="100%" height="100%" paddingLeft={1}>
       <text fg={context.theme.text.base}><b>Plugin Updates</b></text>
       <text fg={context.theme.text.muted}>
-        {statusLine(model)}  ·  ↑/↓/j/k move · Space select · A select all · U update · R refresh · Esc back
+        {statusLine(model)}  ·  ↑/↓/j/k move · Space select · A select all · U update plugins · X reinstall tools · R refresh · Esc back
       </text>
       <box height={1} />
       <text fg={context.theme.text.muted}>Plugins</text>
@@ -247,11 +339,13 @@ function Screen(props: {
       </For>
       <Show when={model.toolsAvailability() !== undefined}>
         <box height={1} />
-        <text fg={context.theme.text.muted}>Managed tools · info only — installed and updated by OpenCode itself</text>
+        <text fg={context.theme.text.muted}>
+          Managed tools · installed on demand by OpenCode · X reinstalls selected &amp; restarts the server
+        </text>
         <For each={toolRows()}>
           {(row, index) => (
             <text fg={context.theme.text.base}>
-              {rowLine(row, pluginRows().length + index(), focus(), apply, sendable())}
+              {rowLine(row, pluginRows().length + index(), focus(), apply, sendable(), model.toolReinstallOutcome(row.name))}
             </text>
           )}
         </For>
@@ -273,17 +367,23 @@ export default Plugin.define({
       runPluginUpdate?: CliUpdateRunner;
       managedTools?: ManagedToolsPort;
       serverLocality?: LocalityPort;
+      managedServer?: ManagedServerPort;
+      serviceControl?: ServiceControlPort;
     };
     const inventory = createServerInventoryPort(context);
     const tui = options.tuiPackages ?? createTuiPackagePort();
     const tools = options.managedTools ?? createManagedToolsPort();
     const locality = options.serverLocality ?? createServerLocalityPort(context.client);
+    const managedServer = options.managedServer ?? createManagedServerPort(context.client);
+    const serviceControl = options.serviceControl ?? createServiceControlPort();
+    const cacheDir = managedCacheDirectory();
     const model = createServerUpdates({
       inventory,
       tui,
       tools,
       locality,
       state: createDurableState(context.storage, STORAGE_KEY, EMPTY_SERVER_STATE),
+      pending: createDurableState<PendingToolsState>(context.storage, PENDING_TOOLS_KEY, EMPTY_PENDING_TOOLS),
       environment: () => connectedLocation(context).directory,
       fetchLatest: createNpmRegistryPort(
         options.registryBaseUrl === undefined ? {} : { baseUrl: options.registryBaseUrl },
@@ -337,7 +437,15 @@ export default Plugin.define({
     const unregister = context.ui.router.register({
       name: ROUTE,
       render: () => (
-        <Screen context={context} model={model} apply={apply} back={() => context.ui.router.navigate(previous)} />
+        <Screen
+          context={context}
+          model={model}
+          apply={apply}
+          managedServer={managedServer}
+          serviceControl={serviceControl}
+          cacheDir={cacheDir}
+          back={() => context.ui.router.navigate(previous)}
+        />
       ),
     });
     const unregisterSlot = context.ui.slot({

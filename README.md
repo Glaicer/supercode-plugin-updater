@@ -45,16 +45,23 @@ Once per 24 hours for the same inventory and environment, and again freshly ever
 - `/plugin-updates` (command palette or slash command) opens a screen with two sections:
 
   - **Plugins** — one line per plugin, with the installed and available version. A plugin that is up to date reads as its installed version alone. A package loaded by both the server and the TUI is listed once and updates both halves; local-path plugins are development fixtures and are never listed. After you confirm, a server half applies **live**: the running server picks up the new plugin behavior without a restart. A TUI half installs a new package generation; the running TUI keeps the loaded version **until it restarts**, and the row says so explicitly (`restart TUI to activate`).
-  - **Managed tools** — the formatters OpenCode installs itself (`prettier`, `oxfmt`, `@biomejs/biome`), marked `info only`. They are never selectable and no key updates them; OpenCode manages their lifecycle. The section appears only when the connected server provably runs on this machine — for a remote (or unverifiable) connection the formatters belong to that other machine and the section reports itself unavailable instead of reading the local cache.
+  - **Managed tools** — the formatters OpenCode installs itself (`prettier`, `oxfmt`, `@biomejs/biome`). OpenCode installs them **on demand** (the first time a format runs) and does not update them on its own. A tool with a confirmed update is selectable; pressing `X` reinstalls the selection and restarts the server (see below). A tool that is up to date or unverified stays informational. The section appears only when the connected server provably runs on this machine — for a remote (or unverifiable) connection the formatters belong to that other machine and the section reports itself unavailable instead of reading the local cache.
 
-- Select what you want (`Space` / `A`), press `U`, and confirm. The confirmation lists every selected plugin once and warns what each half does: server updates change the live server, TUI updates take effect on the next restart, and a plugin shared by both runtimes is sent to the standard CLI **once** — it re-checks and may update either or both runtimes.
+- Select what you want (`Space` / `A`), then confirm the action for that kind: `U` updates plugins, `X` reinstalls managed tools. The plugin confirmation lists every selected plugin once and warns what each half does: server updates change the live server, TUI updates take effect on the next restart, and a plugin shared by both runtimes is sent to the standard CLI **once** — it re-checks and may update either or both runtimes. The managed-tool confirmation warns that reinstalling restarts the shared server.
+
+### Reinstalling managed tools
+
+Managed tools are not updated in place like plugins. Confirming `X` **invalidates the installed cache of exactly the selected tools** and restarts the server, so OpenCode installs fresh versions itself — but only **on next use**, not when the server starts. Because the restart touches everything attached to the shared server, the confirmation spells out that it disconnects connected windows, interrupts agents' current work, and stops server terminals.
+
+After the restart the tools show **`awaiting reinstallation`** — not "updated" — until OpenCode actually installs them again on next use; the installed version is only confirmed from the cache that really appears. The action stops the specific managed background server the TUI is provably connected to (verified against the service registration, not merely localhost) and is unavailable for a remote, standalone, or unconfirmed server. The stop → invalidate → start sequence runs in a detached supervisor, so the server is brought back even if this window's connection drops mid-operation.
 
 | Key | Action |
 | --- | --- |
 | `j` / `k` or arrows | Move the cursor |
-| Space | Toggle the plugin under the cursor (a plugin shared by the server and the TUI selects both halves) |
-| `A` | Select every selectable package |
-| `U` | Update the selection (confirmation dialog first) |
+| Space | Toggle the row under the cursor (a plugin shared by the server and the TUI selects both halves) |
+| `A` | Select every selectable package and updatable tool |
+| `U` | Update the selected plugins (confirmation dialog first) |
+| `X` | Reinstall the selected managed tools and restart the server (confirmation dialog first) |
 | `R` | Re-check now, ignoring the 24h timer |
 | Esc | Close |
 
@@ -64,7 +71,7 @@ After applying, the screen re-reads the inventory and shows the result per row: 
 
 The version shown as `latest` is registry metadata at check time. Applying an update goes through OpenCode's own resolver, which may install a newer release than the one displayed; the screen always reports what actually happened.
 
-The plugin never deletes package cache generations, never writes other plugins' configuration, and never acts on state left by the 0.3.0 (OpenCode 1.x) release — opening the screen, closing it, restarting, or exiting changes nothing on disk beyond what OpenCode's own install machinery does.
+Outside the managed-tool `X` action, the plugin never deletes anything. That action removes the cache generations of exactly the selected managed tools (and nothing else — never a plugin cache, another tool, or a config) as part of the verified stop → invalidate → start sequence. It never writes other plugins' configuration, and never acts on state left by the 0.3.0 (OpenCode 1.x) release — opening the screen, closing it, restarting, or exiting changes nothing on disk beyond what OpenCode's own install machinery does. Closing the TUI does not stop the V2 server and runs no cleanup.
 
 ## The 0.3.0 release (OpenCode 1.x)
 

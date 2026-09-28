@@ -11,12 +11,19 @@ const DIST_FILES = [
   "durable-state.js",
   "managed-tools.js",
   "plugins.js",
+  "reinstall-supervisor.js",
   "server-apply.js",
   "server-inventory.js",
   "server-updates.js",
+  "service-control.js",
+  "tool-reinstall.js",
   "tui-packages.js",
   "update-checker.js",
 ];
+
+// Modules allowed to reach local filesystem/process APIs: the cache/identity
+// reader and the two service adapters that spawn the CLI and the supervisor.
+const LOCAL_STATE_ADAPTERS = ["tui-packages.js", "managed-tools.js", "service-control.js", "reinstall-supervisor.js"];
 
 test("the published TUI entrypoint is precompiled with Solid reactivity", async () => {
   const packageJson = JSON.parse(await readFile(join(root, "package.json"), "utf8")) as {
@@ -37,7 +44,7 @@ test("the compiled V2 modules reach no local filesystem or process API beside th
   for (const file of DIST_FILES) {
     const source = await readFile(join(root, "dist", file), "utf8");
     assert.doesNotMatch(source, /from ["'][^"']+\.tsx?["']/, file);
-    if (file === "tui-packages.js" || file === "managed-tools.js") continue;
+    if (LOCAL_STATE_ADAPTERS.includes(file)) continue;
     assert.doesNotMatch(source, /from ["']node:/, file);
   }
 });
@@ -64,4 +71,25 @@ test("the managed tools adapter only reads the local cache and never mutates or 
   );
   assert.match(source, /from ["']node:fs["']/);
   assert.doesNotMatch(source, /from ["']node:child_process["']/);
+});
+
+test("the service adapter launches the supervisor detached and gates on the managed daemon", async () => {
+  const source = await readFile(join(root, "dist", "service-control.js"), "utf8");
+  // The supervisor must outlive the TUI: detached + unref, never a blocking child.
+  assert.match(source, /detached:\s*true/);
+  assert.match(source, /\.unref\(\)/);
+  // The gate proves the connected server is the registered daemon before any restart.
+  assert.match(source, /readdirSync/);
+  assert.match(source, /registeredPids|service[^/]*\\.json/);
+});
+
+test("the detached supervisor stops, invalidates, and starts in that order and always restarts", async () => {
+  const source = await readFile(join(root, "dist", "reinstall-supervisor.js"), "utf8");
+  // Order is encoded in runSequence: stop, then invalidate, then start; the
+  // invalidation is guarded by a confirmed stop and the start is unconditional.
+  const stopIndex = source.indexOf('["service", "stop"]');
+  const startIndex = source.indexOf('["service", "start"]');
+  assert.ok(stopIndex !== -1 && startIndex !== -1, "the supervisor drives the real service CLI");
+  assert.match(source, /deps\.invalidate/);
+  assert.match(source, /deps\.start\(\)/);
 });

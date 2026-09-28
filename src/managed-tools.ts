@@ -4,7 +4,16 @@ import { isAbsolute, join } from "node:path";
 import type { Plugin } from "@opencode/plugin/tui";
 
 /** The formatter packages OpenCode installs and updates itself. */
-const FORMATTER_TOOLS: readonly string[] = ["prettier", "oxfmt", "@biomejs/biome"];
+export const SUPPORTED_MANAGED_TOOLS: readonly string[] = ["prettier", "oxfmt", "@biomejs/biome"];
+
+/**
+ * The cache directory whose entire contents (every generation) are invalidated
+ * to reinstall one managed tool. Scoped to `<name>@latest`, never a plugin or
+ * another tool.
+ */
+export function managedToolCacheDir(cacheDir: string, name: string): string {
+  return join(cacheDir, "npm", `${name}@latest`);
+}
 
 export interface ManagedTool {
   name: string;
@@ -25,13 +34,13 @@ export interface ManagedToolsPort {
 function newestGeneration(cacheDir: string, name: string): string | undefined {
   let entries: string[];
   try {
-    entries = readdirSync(join(cacheDir, "npm", `${name}@latest`));
+    entries = readdirSync(managedToolCacheDir(cacheDir, name));
   } catch {
     return undefined;
   }
   const generations = entries.filter((entry) => /^\d+$/.test(entry)).toSorted((a, b) => Number(a) - Number(b));
   const generation = generations.at(-1);
-  return generation === undefined ? undefined : join(cacheDir, "npm", `${name}@latest`, generation);
+  return generation === undefined ? undefined : join(managedToolCacheDir(cacheDir, name), generation);
 }
 
 function manifestVersion(generation: string, name: string): string | undefined {
@@ -53,12 +62,17 @@ function cacheDirectory(): string {
   return join(base, "opencode");
 }
 
+/** The V2 npm cache root where managed tools are installed. */
+export function managedCacheDirectory(): string {
+  return cacheDirectory();
+}
+
 export function createManagedToolsPort(roots: { cacheDir?: string } = {}): ManagedToolsPort {
   const cacheDir = roots.cacheDir ?? cacheDirectory();
   return {
     installed() {
       const tools: ManagedTool[] = [];
-      for (const name of FORMATTER_TOOLS) {
+      for (const name of SUPPORTED_MANAGED_TOOLS) {
         const generation = newestGeneration(cacheDir, name);
         // No generation means the host never installed the formatter; an
         // installed one with an unreadable manifest stays visible as unknown.
