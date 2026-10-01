@@ -51,6 +51,52 @@ export function rowIdFor(runtime: Runtime, target: string): string {
   return runtime === "server" ? packageRowId(target) : tuiRowId(target);
 }
 
+export interface ApplySummary {
+  updated: number;
+  unverified: number;
+  unchanged: number;
+  failed: number;
+  missing: number;
+}
+
+/**
+ * A shared Server/TUI pair is one update unit: the summary counts targets,
+ * not rows. A target's updated halves collapse into one verdict — the
+ * strongest one, since both halves ride the same generation — a failed half
+ * always counts, and a not-updated verdict only stands when no half
+ * reported an outcome.
+ */
+export function summarizeApply(results: ReadonlyMap<string, ApplyResult>): ApplySummary {
+  const byTarget = new Map<string, ApplyResult[]>();
+  for (const [id, result] of results) {
+    const separator = id.indexOf(":");
+    const key = separator === -1 ? id : id.slice(separator + 1);
+    const group = byTarget.get(key);
+    if (group === undefined) byTarget.set(key, [result]);
+    else group.push(result);
+  }
+  const summary: ApplySummary = { updated: 0, unverified: 0, unchanged: 0, failed: 0, missing: 0 };
+  for (const group of byTarget.values()) {
+    const updatedRows = group.filter((result) => result.phase === "updated");
+    if (updatedRows.some((result) => result.unverified !== true && result.unchanged !== true)) {
+      summary.updated += 1;
+    } else if (updatedRows.some((result) => result.unchanged === true)) {
+      summary.unchanged += 1;
+    } else if (updatedRows.length > 0) {
+      summary.unverified += 1;
+    }
+    if (group.some((result) => result.phase === "failed")) summary.failed += 1;
+    if (
+      updatedRows.length === 0 &&
+      !group.some((result) => result.phase === "failed") &&
+      group.some((result) => result.phase === "missing")
+    ) {
+      summary.missing += 1;
+    }
+  }
+  return summary;
+}
+
 export interface ServerApplyPorts {
   /** Current server inventory, read again before anything is sent. */
   readonly list: (signal?: AbortSignal) => Promise<readonly InventoryPlugin[]>;

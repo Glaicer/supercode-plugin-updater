@@ -53,7 +53,7 @@ Once per 24 hours for the same inventory and environment, and again freshly ever
 
 Managed tools are not updated in place like plugins. Confirming `X` **invalidates the installed cache of exactly the selected tools** and restarts the server, so OpenCode installs fresh versions itself — but only **on next use**, not when the server starts. Because the restart touches everything attached to the shared server, the confirmation spells out that it disconnects connected windows, interrupts agents' current work, and stops server terminals.
 
-After the restart the tools show **`awaiting reinstallation`** — not "updated" — until OpenCode actually installs them again on next use; the installed version is only confirmed from the cache that really appears. The action stops the specific managed background server the TUI is provably connected to (verified against the service registration, not merely localhost) and is unavailable for a remote, standalone, or unconfirmed server. The stop → invalidate → start sequence runs in a detached supervisor, so the server is brought back even if this window's connection drops mid-operation.
+After the restart the tools show **`cache cleared · will install new version on next use`** — not "updated" — until OpenCode actually installs them again on next use; the installed version is only confirmed from the cache that really appears. The action stops the specific managed background server the TUI is provably connected to (verified against the service registration, not merely localhost) and is unavailable for a remote, standalone, or unconfirmed server. The stop → invalidate → start sequence runs in a detached supervisor, so the server is brought back even if this window's connection drops mid-operation.
 
 | Key | Action |
 | --- | --- |
@@ -67,7 +67,7 @@ After the restart the tools show **`awaiting reinstallation`** — not "updated"
 
 Rows without a confirmed update — pinned, skipped, or unknown — are shown for information but can never be selected. When the host itself confirms an update, the row stays selectable even if the extra registry metadata is unavailable; the version pair then reads `installed → unknown`.
 
-After applying, the screen re-reads the inventory and shows the result per row: `updated · now 1.2.3` is the version actually installed — not the version that was advertised before you confirmed. A target that failed to activate is shown as an activation error, and if the inventory cannot be re-read the row says `inventory unavailable` instead of claiming success. One failed target never blocks the others.
+After applying, the screen re-reads the inventory and shows the result per row: `updated · now 1.2.3` is the version actually installed — not the version that was advertised before you confirmed. A target that failed to activate is shown as an activation error, and if the inventory cannot be re-read the row says `inventory unavailable` instead of claiming success. One failed target never blocks the others. The `Update finished: …` summary counts plugins, not runtimes: a plugin that spans Server and TUI is one update unit — one `updated`, one failure, one `unchanged`/`unverified` — because both halves share the same cache generation.
 
 The version shown as `latest` is registry metadata at check time. Applying an update goes through OpenCode's own resolver, which may install a newer release than the one displayed; the screen always reports what actually happened.
 

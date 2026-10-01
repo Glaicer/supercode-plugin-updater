@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Plugin } from "@opencode/plugin/tui";
 import { createManagedToolsPort, createServerLocalityPort } from "./managed-tools.ts";
-import type { ServerApply } from "./server-apply.ts";
+import { summarizeApply, type ApplyResult, type ServerApply } from "./server-apply.ts";
 import { listedRows, type ServerRow, type ServerUpdates } from "./server-updates.ts";
 import type { CliUpdateResult, TuiPackagePort } from "./tui-packages.ts";
 import { installGeneration } from "./test-generations.ts";
@@ -1298,6 +1298,72 @@ test("the screen lists one line per plugin: a shared pair collapses to its serve
   assert.deepEqual(
     listedRows(setup.model.rows()).map((row) => row.id),
     ["package:exposed", "package:server-only", "tui:tui-only"],
+  );
+});
+
+test("the apply summary counts plugins, not runtimes: a shared pair is one update unit", () => {
+  const results = new Map<string, ApplyResult>([
+    ["package:shared", { phase: "updated" }],
+    ["tui:shared", { phase: "updated" }],
+    ["package:server-only", { phase: "updated" }],
+    ["tui:tui-only", { phase: "failed", message: "update failed" }],
+  ]);
+  const summary = summarizeApply(results);
+  assert.equal(summary.updated, 2); // the shared pair plus the server-only plugin
+  assert.equal(summary.failed, 1);
+  assert.equal(summary.missing, 0);
+});
+
+test("a twin's weaker verdict never doubles a target: halves collapse into one outcome", () => {
+  // The unclaimed TUI half rides the same generation: absorbed by the server half's update.
+  assert.deepEqual(
+    summarizeApply(
+      new Map<string, ApplyResult>([
+        ["package:shared", { phase: "updated" }],
+        ["tui:shared", { phase: "missing", message: "the host did not confirm an update" }],
+      ]),
+    ),
+    { updated: 1, unverified: 0, unchanged: 0, failed: 0, missing: 0 },
+  );
+  // Both halves failed together: one CLI run, one failure.
+  assert.deepEqual(
+    summarizeApply(
+      new Map<string, ApplyResult>([
+        ["package:shared", { phase: "failed", message: "update failed" }],
+        ["tui:shared", { phase: "failed", message: "update failed" }],
+      ]),
+    ),
+    { updated: 0, unverified: 0, unchanged: 0, failed: 1, missing: 0 },
+  );
+  // An unreadable re-read leaves one unverified plugin, not two.
+  assert.deepEqual(
+    summarizeApply(
+      new Map<string, ApplyResult>([
+        ["package:shared", { phase: "updated", unverified: true }],
+        ["tui:shared", { phase: "updated", unverified: true }],
+      ]),
+    ),
+    { updated: 0, unverified: 1, unchanged: 0, failed: 0, missing: 0 },
+  );
+  // A claimed-but-unmoved half absorbs its unconfirmed twin as one unchanged plugin.
+  assert.deepEqual(
+    summarizeApply(
+      new Map<string, ApplyResult>([
+        ["package:shared", { phase: "updated", unchanged: true }],
+        ["tui:shared", { phase: "missing", message: "the host did not confirm an update" }],
+      ]),
+    ),
+    { updated: 0, unverified: 0, unchanged: 1, failed: 0, missing: 0 },
+  );
+  // One failed half never hides behind an updated twin.
+  assert.deepEqual(
+    summarizeApply(
+      new Map<string, ApplyResult>([
+        ["package:shared", { phase: "updated" }],
+        ["tui:shared", { phase: "failed", message: "update failed" }],
+      ]),
+    ),
+    { updated: 1, unverified: 0, unchanged: 0, failed: 1, missing: 0 },
   );
 });
 

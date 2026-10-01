@@ -77,7 +77,7 @@ export function reinstallConfirmationMessage(tools: readonly ReinstallToolLine[]
     ...lines,
     "",
     "Reinstalling managed tools restarts the shared OpenCode server. This disconnects connected windows, interrupts agents' current work, and stops server terminals.",
-    "OpenCode installs the tools again on next use — not immediately when the server starts. Until then they show as awaiting reinstallation.",
+    "OpenCode installs the tools again on next use — not immediately when the server starts. Until then they show as cache cleared · will install new version on next use.",
   ].join("\n");
 }
 
@@ -86,7 +86,7 @@ export function toolPhaseLabel(outcome: ToolReinstallOutcome): string {
     case "reinstalling":
       return "reinstalling…";
     case "pending":
-      return "awaiting reinstallation";
+      return "cache cleared · will install new version on next use";
     case "reinstalled":
       return `reinstalled · now ${outcome.version ?? "unknown"}`;
     case "invalidation-failed":

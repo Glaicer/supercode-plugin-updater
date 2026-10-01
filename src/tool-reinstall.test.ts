@@ -55,13 +55,17 @@ test("the reinstall confirmation warns about the shared server restart and defer
   assert.match(message, /interrupts agents' current work/i);
   assert.match(message, /stops server terminals/i);
   assert.match(message, /on next use — not immediately/i);
+  assert.ok(message.includes("cache cleared · will install new version on next use"));
 });
 
 test("an invalidated tool reads pending until the cache actually shows a reinstall", () => {
   const entry: PendingTool = { name: "prettier", previousVersion: "3.0.0", at: 1_000 };
   // Cache gone: awaiting OpenCode's own install on next use — never "updated".
   assert.equal(reconcilePendingTool(entry, undefined, 2_000).phase, "pending");
-  assert.equal(toolPhaseLabel(reconcilePendingTool(entry, undefined, 2_000)), "awaiting reinstallation");
+  assert.equal(
+    toolPhaseLabel(reconcilePendingTool(entry, undefined, 2_000)),
+    "cache cleared · will install new version on next use",
+  );
   // Same version back in the cache within the window is still in flight.
   assert.equal(reconcilePendingTool(entry, "3.0.0", 2_000).phase, "reinstalling");
   // Same version after the window means the invalidation never took effect.

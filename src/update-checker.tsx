@@ -1,6 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import { Plugin } from "@opencode/plugin/tui";
-import { For, Show, createSignal } from "solid-js";
+import { For, Show, createEffect, createSignal, onCleanup } from "solid-js";
 import { createNpmRegistryPort } from "./checker.ts";
 import { createDurableState } from "./durable-state.ts";
 import {
@@ -15,6 +15,7 @@ import {
   createServerApply,
   rowIdFor,
   settleKey,
+  summarizeApply,
   type ServerApply,
 } from "./server-apply.ts";
 import {
@@ -140,20 +141,25 @@ function rowLine(
   return `${focus}${mark} ${line(row, reinstall)}${result ? `  ·  ${result}` : ""}`;
 }
 
-function applyStatus(apply: ServerApply): string {
-  if (apply.running()) return "Updating plugins…";
-  const results = [...apply.results().values()];
-  if (results.length === 0) return "";
-  const updated = results.filter((result) => result.phase === "updated" && !result.unverified && !result.unchanged).length;
-  const unverified = results.filter((result) => result.phase === "updated" && result.unverified).length;
-  const unchanged = results.filter((result) => result.phase === "updated" && result.unchanged).length;
-  const failed = results.filter((result) => result.phase === "failed").length;
-  const missing = results.filter((result) => result.phase === "missing").length;
-  const suffix = [
-    ...(unverified > 0 ? [` · ${unverified} unverified`] : []),
-    ...(unchanged > 0 ? [` · ${unchanged} unchanged`] : []),
-  ].join("");
-  return `Update finished: ${updated} updated${suffix} · ${failed} failed · ${missing} not updated.`;
+export function createApplyStatus(apply: ServerApply): () => string {
+  const [dots, setDots] = createSignal(1);
+  createEffect(() => {
+    if (!apply.running()) return;
+    setDots(1);
+    const timer = setInterval(() => setDots((count) => (count % 3) + 1), 500);
+    onCleanup(() => clearInterval(timer));
+  });
+  return () => {
+    if (apply.running()) return `Updating plugins${".".repeat(dots())}`;
+    const results = apply.results();
+    if (results.size === 0) return "";
+    const { updated, unverified, unchanged, failed, missing } = summarizeApply(results);
+    const suffix = [
+      ...(unverified > 0 ? [` · ${unverified} unverified`] : []),
+      ...(unchanged > 0 ? [` · ${unchanged} unchanged`] : []),
+    ].join("");
+    return `Update finished: ${updated} updated${suffix} · ${failed} failed · ${missing} not updated.`;
+  };
 }
 
 function statusLine(model: ServerUpdates): string {
@@ -201,6 +207,7 @@ function Screen(props: {
 }) {
   const { context, model, apply, managedServer, serviceControl, cacheDir } = props;
   const [cursor, setCursor] = createSignal(0);
+  const applyStatus = createApplyStatus(apply);
   // One membership computation per render, not one per row.
   const sendable = () => new Set(apply.selectedRows(model.rows()).map((row) => row.id));
   // The screen walks the listed rows; the model keeps the hidden halves and
@@ -330,7 +337,7 @@ function Screen(props: {
       <text fg={context.theme.text.muted}>
         {statusLine(model)}  ·  ↑/↓/j/k move · Space select · A select all · U update plugins · X reinstall tools · R refresh · Esc back
       </text>
-      <box height={1} />
+      <text>{" "}</text>
       <text fg={context.theme.text.muted}>Plugins</text>
       <For each={pluginRows()}>
         {(row, index) => (
@@ -338,7 +345,7 @@ function Screen(props: {
         )}
       </For>
       <Show when={model.toolsAvailability() !== undefined}>
-        <box height={1} />
+        <text>{" "}</text>
         <text fg={context.theme.text.muted}>
           Managed tools · installed on demand by OpenCode · X reinstalls selected &amp; restarts the server
         </text>
@@ -353,7 +360,9 @@ function Screen(props: {
           <text fg={context.theme.text.muted}>{toolsNote()}</text>
         </Show>
       </Show>
-      <text fg={context.theme.text.muted}>{applyStatus(apply)}</text>
+      <text>{" "}</text>
+      <text fg={context.theme.text.muted}>{applyStatus()}</text>
+      <text>{" "}</text>
     </box>
   );
 }
